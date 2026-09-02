@@ -40,7 +40,14 @@ CONTROL_HZ = 50.0
 # more than the control step itself and shows up as jitter at the trainer.
 GUI_PERIOD = 0.1
 RECV_TIMEOUT = 30.0
+# Connecting must fail fast. The control loop is single threaded, so a blocking
+# connect freezes sensing and the display with it -- which looks exactly like a
+# stale sensor. A refused connection returns immediately; this only bounds the
+# case where the trainer's host swallows the SYN.
+CONNECT_TIMEOUT = 0.5
 RETRY_DELAY = 2.0
+# How often the idle loop refreshes the display while waiting for a trainer.
+IDLE_PERIOD = 0.05
 ROBOT_ID = 1
 
 context = None  # Activity context, injected by abcvlib.py.
@@ -77,8 +84,13 @@ class WheelSubscriber(dynamic_proxy(WheelDataSubscriber)):
         sensors['wheel_count_r'] = float(wheel_count_r)
         sensors['wheel_distance_l'] = float(wheel_distance_l)
         sensors['wheel_distance_r'] = float(wheel_distance_r)
-        sensors['wheel_speed_l'] = float(wheel_speed_exp_avg_l)
-        sensors['wheel_speed_r'] = float(wheel_speed_exp_avg_r)
+        # Instantaneous, not the exponential average. Wheel data arrives over
+        # serial at only ~5.5Hz, so an EMA at weight 0.1 has a time constant
+        # near 2s: measured, a 0.5s command produced 6s of reported wheel
+        # motion decaying 2098 -> 320 -> 86 -> 1. That lag is invisible in the
+        # logs but poisons any controller that reads wheel speed.
+        sensors['wheel_speed_l'] = float(wheel_speed_instant_l)
+        sensors['wheel_speed_r'] = float(wheel_speed_instant_r)
 
 
 class OrientationSubscriber(dynamic_proxy(OrientationDataSubscriber)):
@@ -106,7 +118,7 @@ def setup():
 
     wheel_data = (WheelData.Builder(context, publisher_manager)
                   .setBufferLength(10)
-                  .setExpWeight(0.1)
+                  .setExpWeight(0.5)
                   .build())
     wheel_data.addSubscriber(WheelSubscriber())
 
@@ -127,8 +139,15 @@ def loop():
     """One control step, or one reconnect attempt if we are not connected."""
     global step, next_tick
     if sock is None:
+        # Keep refreshing the screen while idle, so the phone is a usable
+        # sensor readout on its own and not only while a trainer is attached.
+        # Connection attempts stay on their own slower cadence.
         stop_wheels()
-        connect()
+        update_gui()
+        if time.monotonic() - last_attempt >= RETRY_DELAY:
+            connect()
+        else:
+            time.sleep(IDLE_PERIOD)
         return
     try:
         # Split the step so a stall can be attributed. wait_ms is time blocked
@@ -166,11 +185,17 @@ def update_gui():
     """Mirror the current step onto the phone screen, at a human rate."""
     global last_report, last_gui, control_hz
     now = time.monotonic()
-    if last_report:
+    if sock is None:
+        # Idle refresh rate is not the control rate; do not let it pollute it.
+        control_hz = 0.0
+        last_report = 0.0
+    elif last_report:
         # Exponential average, so a single slow step does not dominate.
         measured = 1.0 / max(now - last_report, 1e-6)
         control_hz = 0.9 * control_hz + 0.1 * measured
-    last_report = now
+        last_report = now
+    else:
+        last_report = now
     if now - last_gui < GUI_PERIOD:
         return
     last_gui = now
@@ -220,13 +245,12 @@ def stop_wheels():
 def connect():
     """Try once to reach the trainer, without blocking the loop for long."""
     global sock, stream, last_attempt, next_tick
-    now = time.monotonic()
-    if now - last_attempt < RETRY_DELAY:
-        time.sleep(RETRY_DELAY - (now - last_attempt))
     last_attempt = time.monotonic()
     address = (BuildConfig.IP, BuildConfig.PORT)
     try:
-        candidate = socket.create_connection(address, timeout=RECV_TIMEOUT)
+        candidate = socket.create_connection(address, timeout=CONNECT_TIMEOUT)
+        # Reads block for much longer than the connect handshake may.
+        candidate.settimeout(RECV_TIMEOUT)
         candidate.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         sock, stream = candidate, candidate.makefile('rb')
         write(dict(type='hello', protocol=PROTOCOL, control_hz=CONTROL_HZ,
