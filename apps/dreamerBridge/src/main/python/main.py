@@ -24,6 +24,7 @@ import socket
 import struct
 import time
 
+from android.os import SystemClock
 from java import dynamic_proxy
 from jp.oist.abcvlib.core import BuildConfig
 from jp.oist.abcvlib.core.inputs import PublisherManager
@@ -65,6 +66,8 @@ sensors = dict(
 
 sock = None
 stream = None
+imu_stamp = 0.0     # monotonic time of the last orientation callback
+imu_age_ms = 0.0    # sensor hardware time to callback, milliseconds
 step = 0
 next_tick = 0.0
 last_attempt = 0.0
@@ -96,8 +99,16 @@ class WheelSubscriber(dynamic_proxy(WheelDataSubscriber)):
 class OrientationSubscriber(dynamic_proxy(OrientationDataSubscriber)):
 
     def onOrientationUpdate(self, timestamp, theta_rad, angular_velocity_rad):
+        global imu_stamp, imu_age_ms
         sensors['theta'] = float(theta_rad)
         sensors['angular_velocity'] = float(angular_velocity_rad)
+        # `timestamp` is the hardware sensor-event time from the Android HAL,
+        # on the same clock as elapsedRealtimeNanos, so their difference is the
+        # true sensor-to-app age including any batching. This is the only way to
+        # measure pipeline delay without a synchronised external event: a
+        # constant lag is invisible in a trace of the signal itself.
+        imu_age_ms = (SystemClock.elapsedRealtimeNanos() - timestamp) / 1e6
+        imu_stamp = time.monotonic()
 
 
 class BatterySubscriber(dynamic_proxy(BatteryDataSubscriber)):
@@ -170,6 +181,10 @@ def loop():
         write(dict(type='obs', step=step, t=time.time(),
                    wait_ms=(after_read - before_read) * 1e3,
                    work_ms=(before_write - after_read) * 1e3,
+                   # Two halves of the sensor pipeline: hardware to callback,
+                   # then callback to the moment we ship the observation.
+                   imu_age_ms=imu_age_ms,
+                   imu_stale_ms=(before_write - imu_stamp) * 1e3 if imu_stamp else -1.0,
                    sensors=dict(sensors)))
         step += 1
     except Exception as e:
