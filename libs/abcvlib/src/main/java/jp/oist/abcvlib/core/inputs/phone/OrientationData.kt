@@ -188,56 +188,28 @@ class OrientationData(context: Context, publisherManager: PublisherManager) :
      * Registering sensorEventListeners for accelerometer and gyroscope only.
      */
     fun register(handler: Handler) {
-        // Check if rotation_sensor exists before trying to turn on the listener
+        // Only the rotation vector is registered, and at a bounded rate.
+        //
+        // This used to register the rotation vector, gyroscope, accelerometer
+        // and uncalibrated accelerometer, all at SENSOR_DELAY_FASTEST, onto a
+        // single sensorThread -- while onSensorChanged only ever handles
+        // TYPE_ROTATION_VECTOR, so three of the four produced events purely to
+        // be discarded. The thread could not drain that, and the queue reached
+        // a standing backlog: measured on a Pixel 3a, sensor events arrived at
+        // the app 8.5 SECONDS after their hardware timestamp, which makes any
+        // closed-loop control impossible while looking like a healthy signal.
         if (rotationSensor != null) {
             sensorManager.registerListener(
                 this,
                 rotationSensor,
-                SensorManager.SENSOR_DELAY_FASTEST,
+                SAMPLING_PERIOD_US,
                 handler
             )
         } else {
-            Logger.e("SensorTesting", "No Default rotation_sensor Available.")
-        }
-        // Check if gyro exists before trying to turn on the listener
-        if (gyroscope != null) {
-            sensorManager.registerListener(
-                this,
-                gyroscope,
-                SensorManager.SENSOR_DELAY_FASTEST,
-                handler
-            )
-        } else {
-            Logger.e("SensorTesting", "No Default gyroscope Available.")
-        }
-        // Check if rotation_sensor exists before trying to turn on the listener
-        if (accelerometer != null) {
-            sensorManager.registerListener(
-                this,
-                accelerometer,
-                SensorManager.SENSOR_DELAY_FASTEST,
-                handler
-            )
-        } else {
-            Logger.e("SensorTesting", "No Default accelerometer Available.")
-        }
-        // Check if rotation_sensor exists before trying to turn on the listener
-        if (accelerometerUncalibrated != null) {
-            sensorManager.registerListener(
-                this,
-                accelerometerUncalibrated,
-                SensorManager.SENSOR_DELAY_FASTEST,
-                handler
-            )
-        } else {
-            Logger.e("SensorTesting", "No Default accelerometer_uncalibrated Available.")
+            Logger.e("SensorTesting", "No rotation vector sensor available")
         }
     }
 
-    /**
-     * Check if accelerometer and gyroscope objects still exist before trying to unregister them.
-     * This prevents null pointer exceptions.
-     */
     fun unregister() {
         // Check if rotation_sensor exists before trying to turn off the listener
         if (rotationSensor != null) {
@@ -289,6 +261,13 @@ class OrientationData(context: Context, publisherManager: PublisherManager) :
         /**
          * @return utility function converting radians to degrees
          */
+        /**
+         * Sampling period in microseconds. 5000us is 200Hz, far above any
+         * control loop here and low enough that the sensor thread keeps up.
+         * SENSOR_DELAY_FASTEST let the queue build an 8.5s backlog.
+         */
+        const val SAMPLING_PERIOD_US = 5000
+
         fun getThetaDeg(radians: Double): Double {
             return (radians * (180 / Math.PI))
         }
