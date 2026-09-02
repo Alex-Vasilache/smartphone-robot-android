@@ -2,6 +2,10 @@
 
 `basicAssembler` is the current RL-oriented demo app.
 
+It keeps the policy on the phone. To train instead against an agent running
+on a computer, with the robot as the environment, see
+[DreamerV3 Bridge](dreamer-bridge.md).
+
 ## Where To Customize basicAssembler
 
 The policy loop is in:

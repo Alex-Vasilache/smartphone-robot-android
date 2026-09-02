@@ -9,6 +9,8 @@ publisher setup, and UI wiring.
 - `backAndForthPython`: minimal Python wheel-output loop.
 - `basicSubscriberPython`: Python subscriber example that receives sensor and
   robot callbacks through Kotlin/Java interfaces.
+- `dreamerBridge`: Python control loop that hands each step to a DreamerV3
+  agent on a computer; see [DreamerV3 Bridge](dreamer-bridge.md).
 
 ## Runtime Flow
 

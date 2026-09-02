@@ -12,7 +12,8 @@
     "pidBalancer",
     "backAndForthPython",
     "basicSubscriberPython",
-    "rosbridgeTest"
+    "rosbridgeTest",
+    "dreamerBridge"
   ],
   "libs": [
     "abcvlib"

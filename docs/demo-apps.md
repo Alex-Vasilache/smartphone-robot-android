@@ -16,3 +16,5 @@
 - `handsOnApp`: object-detection and wheel-control demo with on-screen debug data.
 - `pidBalancer`: balancing/controller example.
 - `rosbridgeTest`: ROS bridge connectivity and smoke-test app.
+- `dreamerBridge`: puts the robot in the training loop of a DreamerV3
+  agent running on a computer; see [DreamerV3 Bridge](dreamer-bridge.md).

@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <item name="voltageBatt" type="id" />
+    <item name="voltageCharger" type="id" />
+    <item name="frameLayout" type="id" />
+    <item name="frameRateHeader" type="id" />
+</resources>

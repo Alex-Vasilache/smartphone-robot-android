@@ -1,0 +1,17 @@
+<resources>
+    <string name="app_name">dreamer Bridge</string>
+    <string name="voltageBatteryHeader">Battery Voltage: </string>
+    <string name="voltageChargerHeader">Charger Voltage: </string>
+    <string name="tiltAngleHeader">Tilt Angle (deg): </string>
+    <string name="angularVelocityHeader">Angular Velocity (deg/s): </string>
+    <string name="leftWheelHeader">Left Wheel C:D:S </string>
+    <string name="rightWheelHeader">Right Wheel C:D:S </string>
+    <string name="soundDataHeader">Step: </string>
+    <string name="frameRateHeader">Control Hz: </string>
+    <string name="leftWheelHeaderText">Left Wheel C:D:SI:SB:SE</string>
+    <string name="rightWheelHeaderText">Right Wheel C:D:SI:SB:SE</string>
+    <string name="coilVoltageTextValue">0.00</string>
+    <string name="coilVoltageHeaderValue">Coil Voltage: </string>
+    <string name="qrDataHeader">Trainer: </string>
+    <string name="objectDetectorHeader">Action: </string>
+</resources>
