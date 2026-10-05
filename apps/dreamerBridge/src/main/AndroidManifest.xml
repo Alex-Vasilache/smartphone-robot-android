@@ -3,6 +3,10 @@
 
     <uses-feature android:name="android.hardware.camera" />
 
+    <!-- WifiLock(WIFI_MODE_FULL_HIGH_PERF): keeps the radio out of power
+         save, which otherwise clumps the 50Hz observation stream. -->
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
 

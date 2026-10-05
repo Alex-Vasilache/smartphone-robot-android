@@ -29,6 +29,7 @@ class SerialCommManager @JvmOverloads constructor(
 
     private var command: ByteArray? = null
     private var queuedMotorLevelsAtMs: Long = 0L
+    private var queuedAtNs: Long = 0L
     private var queuedMotorLevelsTrace: MotorCommandTrace? = null
     private var nextSerialTraceSeq: Long = 1L
     private var inFlightTrace: SerialCommandTrace? = null
@@ -77,6 +78,7 @@ class SerialCommManager @JvmOverloads constructor(
 
     private fun buildAndroid2PiWriter(context: RunContext): Runnable = Runnable {
         startTimeAndroid = System.nanoTime()
+        var queueWaitNs = 0L
         while (!context.stopRequested.get()) {
             val nextCommand: ByteArray? = try {
                 synchronized(commandLock) {
@@ -97,6 +99,10 @@ class SerialCommManager @JvmOverloads constructor(
                     )
                     command = null
                     queuedMotorLevelsTrace = null
+                    val dequeuedNs = System.nanoTime()
+                    ControlLatencyTrace.stampDequeued(dequeuedNs)
+                    queueWaitNs = if (queuedAtNs > 0L) dequeuedNs - queuedAtNs else 0L
+                    queuedAtNs = 0L
                     localCommand
                 }
             } catch (e: InterruptedException) {
@@ -112,7 +118,25 @@ class SerialCommManager @JvmOverloads constructor(
                 queuedMotorLevelsAtMs = 0L
             }
             logSerialTx(inFlightTrace)
-            sendPacket(nextCommand)
+            val isMotor = AndroidToRP2040Command.getEnumByValue(nextCommand[1]) ==
+                    AndroidToRP2040Command.SET_MOTOR_LEVELS
+            if (ControlLatencyTrace.asyncMotor && isMotor) {
+                // Fire and forget, then drain whatever the RP2040 has answered
+                // in the meantime. The state packets still land, they are just
+                // no longer something a wheel command has to wait behind.
+                val t0 = System.nanoTime()
+                try {
+                    usbSerial.sendOnly(nextCommand)
+                } catch (e: IOException) {
+                    throw RuntimeException(e)
+                }
+                val t1 = System.nanoTime()
+                parseFifoPacket()
+                ControlLatencyTrace.record(
+                    queueWaitNs / 1000, 0L, (t1 - t0) / 1000, 0L)
+            } else {
+                sendPacket(nextCommand, queueWaitNs)
+            }
             cnt++
             if (cnt == 100) {
                 durationAndroid = (System.nanoTime() - startTimeAndroid) / 100
@@ -260,11 +284,17 @@ class SerialCommManager @JvmOverloads constructor(
      * @return 0 if successful, -1 if mResponse is not large enough to hold all response and the stop mark,
      * -2 if SerialTimeoutException on send
      */
-    private fun sendPacket(bytes: ByteArray): Int {
+    private fun sendPacket(bytes: ByteArray, queueWaitNs: Long = 0L): Int {
         require(bytes.size == AndroidToRP2040Packet.packetSize) {
             "Input byte array must have a length of " + AndroidToRP2040Packet.packetSize
         }
+        // Three stages, timed separately: clearing the parser, the USB bulk
+        // write, and waiting for the RP2040 to answer. Their sum is what a
+        // controller actually pays to move a wheel, and until it was split
+        // there was no way to tell whose fault the ~84ms was.
+        val t0 = System.nanoTime()
         usbSerial.prepareForCommand(AndroidToRP2040Command.getEnumByValue(bytes[1]))
+        val t1 = System.nanoTime()
         try {
             this.usbSerial.send(bytes, 10000)
         } catch (e: SerialTimeoutException) {
@@ -275,7 +305,11 @@ class SerialCommManager @JvmOverloads constructor(
         } catch (e: IOException) {
             throw RuntimeException(e)
         }
+        val t2 = System.nanoTime()
         receivePacket()
+        val t3 = System.nanoTime()
+        ControlLatencyTrace.record(
+            queueWaitNs / 1000, (t1 - t0) / 1000, (t2 - t1) / 1000, (t3 - t2) / 1000)
         return 0
     }
 
@@ -285,6 +319,7 @@ class SerialCommManager @JvmOverloads constructor(
             //Note this is actually calling the functions like parseLog, parseStatus, etc.
             parseFifoPacket()
         } else {
+            ControlLatencyTrace.timeoutCount++
             inFlightTrace?.let {
                 Logger.e(
                     "BasicAssemblerTrace",
@@ -439,6 +474,12 @@ class SerialCommManager @JvmOverloads constructor(
             if (activeContext.stopRequested.get()) {
                 return
             }
+            // One slot, not a queue: if the previous command has not been
+            // sent yet it is silently replaced. That is the right policy for
+            // a controller (the newest action is the only useful one) but it
+            // means the wheels never see most of what the policy chose, so
+            // count it rather than letting it stay invisible.
+            if (command != null) ControlLatencyTrace.droppedCount++
             command =
                 generateSetMotorLevels(androidToRP2040Packet, left, right, leftBrake, rightBrake)
             queuedMotorLevelsTrace = MotorCommandTrace(
@@ -450,6 +491,9 @@ class SerialCommManager @JvmOverloads constructor(
                 rightControl = command!![3]
             )
             queuedMotorLevelsAtMs = SystemClock.uptimeMillis()
+            queuedAtNs = System.nanoTime()
+            ControlLatencyTrace.stampQueued(queuedAtNs)
+            ControlLatencyTrace.markQueued()
             commandLock.notify()
         }
     }
@@ -467,6 +511,7 @@ class SerialCommManager @JvmOverloads constructor(
                 return
             }
             command = generateGetLogCmd()
+            ControlLatencyTrace.markQueued()
             queuedMotorLevelsTrace = null
             queuedMotorLevelsAtMs = 0L
             commandLock.notify()
@@ -512,6 +557,10 @@ class SerialCommManager @JvmOverloads constructor(
             )
             rp2040State.batteryDetails.voltageMv = byteBuffer.getShort()
             rp2040State.batteryDetails.safetyStatus = byteBuffer.get()
+            ControlLatencyTrace.recordState(
+                rp2040State.motorsState.faults.left,
+                rp2040State.motorsState.faults.right,
+                rp2040State.batteryDetails.safetyStatus)
             rp2040State.batteryDetails.temperature = byteBuffer.getShort()
             rp2040State.batteryDetails.stateOfHealth = byteBuffer.get()
             rp2040State.batteryDetails.flags = byteBuffer.getShort()

@@ -1,5 +1,7 @@
 package jp.oist.abcvlib.dreamerBridge
 
+import android.content.Context
+import android.net.wifi.WifiManager
 import android.os.Bundle
 import androidx.lifecycle.lifecycleScope
 import com.chaquo.python.PyException
@@ -18,15 +20,46 @@ class MainActivity : AbcvlibActivity(), SerialReadyListener {
     lateinit var binding: ActivityMainBinding
     lateinit var guiUpdater: GuiUpdater
 
+    /**
+     * Keeps the WiFi radio out of power save for the length of a run.
+     *
+     * Measured 2026-09-03: without it the control loop's own tick was clean at
+     * 20.0ms but the trainer received those frames in clumps -- p90 46ms, p99
+     * 176ms between arrivals, 1.47 frames per wake -- and ICMP to this phone
+     * ran 6ms best case against a 129ms average. That is the radio dozing
+     * between beacons and the access point buffering for it. It cost a third
+     * of every observation at 50Hz.
+     */
+    private var wifiLock: WifiManager.WifiLock? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         enableMainLoop(false)
+        // The serial reader hex-dumps every chunk at debug level; that runs
+        // between the RP2040's reply and the control loop seeing it.
+        Logger.setQuiet(true)
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
         guiUpdater = GuiUpdater(binding, this)
         // A robot run is unattended; letting the screen sleep would suspend the
         // control loop and the trainer would sit blocked waiting for us.
         binding.root.keepScreenOn = true
+        val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE)
+                as WifiManager
+        wifiLock = wifi.createWifiLock(
+            WifiManager.WIFI_MODE_FULL_HIGH_PERF, "dreamerBridge:link"
+        ).apply {
+            setReferenceCounted(false)
+            acquire()
+        }
         super.onCreate(savedInstanceState)
+    }
+
+    override fun onDestroy() {
+        // Held for the length of a run, not the length of the process: leaving
+        // the radio pinned after the app is gone is a battery bug.
+        wifiLock?.let { if (it.isHeld) it.release() }
+        wifiLock = null
+        super.onDestroy()
     }
 
     override fun onSerialReady(usbSerial: UsbSerial) {

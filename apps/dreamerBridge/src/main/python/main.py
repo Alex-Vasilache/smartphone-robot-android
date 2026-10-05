@@ -1,10 +1,21 @@
 """Phone side of the DreamerV3 bridge.
 
 The policy runs on the training computer, not here. Each control step this
-client receives one action, applies it to the wheels, waits out the control
-period, then reports the proprio sensors it collected. The phone therefore owns
-the control clock and the trainer blocks on us, which keeps the two ends in
-lockstep and means an action is never applied twice.
+client applies an action to the wheels, waits out the control period, then
+reports the proprio sensors it collected. The phone owns the control clock.
+
+The trainer's handshake reply picks how tightly the two ends are coupled:
+
+* Pipelined (the default). We tick on our own clock at CONTROL_HZ, apply the
+  most recent action that has arrived, and report every tick without ever
+  blocking on the trainer. The round trip hides inside the control period, so
+  the loop runs at CONTROL_HZ no matter what the policy costs. An action
+  therefore lands one tick after the observation that prompted it, and an
+  action can be applied over more than one tick if the next one is late.
+
+* Lock-step (`pipeline` false in the handshake). We block for an action before
+  every tick, so an action is never applied twice but the loop rate is
+  1/(control period + round trip). Measured at ~9.7Hz against a 50Hz tick.
 
 The trainer is `embodied/envs/robot.py` in the dreamerv3 repo, and
 `tools/fake_robot_phone.py` there is the same protocol without a robot, useful
@@ -20,6 +31,7 @@ Set the trainer address in `config.json` at the repository root (copy
 
 import json
 import math
+import os
 import socket
 import struct
 import time
@@ -32,9 +44,11 @@ from jp.oist.abcvlib.core.inputs.microcontroller import (
     BatteryData, WheelData, BatteryDataSubscriber, WheelDataSubscriber)
 from jp.oist.abcvlib.core.inputs.phone import (
     OrientationData, OrientationDataSubscriber)
-from jp.oist.abcvlib.util import SerialCommManager
+from jp.oist.abcvlib.util import (
+    ControlLatencyTrace, SensorLatencyTrace, SerialCommManager)
+from jp.oist.abcvlib.dreamerBridge import SensorSnapshot
 
-PROTOCOL = 1
+PROTOCOL = 3
 CONTROL_HZ = 50.0
 # The GUI is for a human watching the robot, so it does not need to keep up
 # with the control loop. Above ~10 Hz the runOnUiThread hop starts costing
@@ -47,9 +61,102 @@ RECV_TIMEOUT = 30.0
 # case where the trainer's host swallows the SYN.
 CONNECT_TIMEOUT = 0.5
 RETRY_DELAY = 2.0
+# Pipelined mode never blocks on the trainer, so nothing stops the wheels by
+# itself if the trainer stalls or the link goes quiet: without this the robot
+# keeps driving the last action it got. Lock-step got this for free.
+ACTION_TIMEOUT = 1.0
 # How often the idle loop refreshes the display while waiting for a trainer.
 IDLE_PERIOD = 0.05
 ROBOT_ID = 1
+# How the control loop paces itself. 'serial': one decision per RP2040 command
+# cycle, taken the moment the previous reply lands -- the only instant a new
+# command is applied promptly, because the microcontroller reads USB only
+# between commands and is busy for ~83 ms after each one. 'clock': the original
+# CONTROL_HZ tick, which on this firmware gets the same 12 Hz of wheel updates
+# but chooses them at random from the tick stream and applies them ~20-40 ms
+# late. The trainer may override this in the handshake.
+PACE = 'serial'
+# Sample this long after the RP2040's reply. Measured 2026-09-16 by sweeping
+# it: the firmware's first USB poll that a command can catch is ~13.5 ms after
+# the reply is seen here, and polls repeat every 10 ms. With the policy at
+# ~6 ms and drive() at ~1 ms, sampling at +3..4 ms is the freshest observation
+# whose command still makes that poll; +8 misses it and costs a whole poll.
+WAKE_LEAD_MS = 3.0
+# Serial pacing, trainer-driven: how long to hold the free microcontroller
+# waiting for the trainer's action before repeating the last one. The round
+# trip is ~10 ms; the firmware polls every 10 ms, so a miss costs one poll.
+ACT_WAIT_MS = 25.0
+# While waiting for the RP2040, spin on the idle check instead of sleeping in
+# 1 ms slices. A core that sleeps ~90 ms of every 100 has its clock dropped by
+# the governor, and the policy then runs cold: measured 2026-09-14, 21-25 ms
+# per step in the loop against 3.5 ms in a hot benchmark on the same phone.
+# Each Java call in the spin releases the GIL, so the sensor callbacks still
+# get through.
+SPIN_WAIT = False
+# Spin (no sleep) for the last few ms before the reply is due, so the core
+# does not drop into idle between the warm-up and the real step. Bounded, and
+# safe now that no sensor callback needs the GIL. 0 disables.
+SPIN_BEFORE_MS = 0.0
+# Decide *before* the reply lands: sample and run the policy this many ms
+# before the RP2040's reply is due, then write the command the instant the
+# link is free. The observation is older by that much, but the command is in
+# the microcontroller's FIFO for its first poll rather than its second, which
+# is one 10 ms poll off the cycle. 0 disables (decide after the reply).
+PRESAMPLE_MS = 0.0
+# Trainer-driven counterpart: ship the observation this long before the reply
+# is due, so the trainer's action (~17 ms round trip) is back by the time the
+# link is free and the command makes the +13.5 ms poll. Measured 2026-09-16:
+# without it the cycle was 112 ms; the observation is ~10 ms older at apply.
+TRAINER_PRESAMPLE_MS = 12.0
+# Pin the control thread to the big cores (CPUs 6-7 on the Pixel 3a): the
+# policy step's p95 went from 24 ms to 10 ms with nothing else changed.
+PIN_CPUS = (6, 7)
+# Precompute the observation-independent half of the policy step (the GRU)
+# right after each action, while the RP2040 is busy. See PolicyRunner.prepare.
+PREPARE_AHEAD = True
+# Longest the loop will wait for the RP2040 before going on without it. A
+# normal cycle is ~83 ms and a coast-induced stall was 1.09 s; a dead link is
+# forever, and measured 2026-09-16 the loop then hung in wait_for_serial with
+# the trainer connected and no observation ever sent. Past this the frame is
+# still reported, with `ser_ok` false, and the command is queued for when the
+# link comes back.
+SERIAL_WAIT_MAX_MS = 250.0
+# Run a throwaway policy step this many ms before the RP2040's reply is due,
+# so the real one runs on a warm core. The step costs 3.5 ms hot and 10 ms
+# cold on this phone (measured 2026-09-16, sensors already off the GIL and the
+# thread pinned to the big cores), and 10 ms is just enough to miss the
+# firmware's first USB poll after its reply, which costs a whole extra poll
+# per cycle. The reply lands ~81 ms after the previous dequeue, p95 87.
+# 0 disables.
+WARM_MS = 14.0
+# Typical dequeue -> reply on this firmware; only used to time the warm-up.
+REPLY_MS = 81.0
+# Largest change in wheel command per drive() call, passed to
+# Outputs.setWheelOutput. abcvlib's default of 0.4 makes a reversal step
+# through 0.0, which the firmware maps to coast; measured 2026-09-14, every
+# 1 s serial stall followed a coast -> drive step. The trainer may set this per
+# action ('slew') to test alternatives.
+SLEW_MAX = 2.0
+# What to send when the command is inside the dead zone, |cmd| < 0.097, which
+# abcvlib maps to coast (H-bridge off). Measured 2026-09-14 with a PRBS
+# between 0.4 and 0: coast -> drive transitions stalled the RP2040 for 1.09 s
+# on 9 of 15 edges (DRV8830 UVLO when the bridge re-energises, then the
+# firmware's 1 s I2C timeout); 'brake' and 'min' gave 0 stalls in ~270 cycles.
+#   'coast'  pass it through (abcvlib behaviour)
+#   'brake'  short the motor instead (IN1 = IN2 = 1); bridge stays energised
+#   'min'    the smallest driven value, keeping the sign of the last command --
+#            ~0.66 V on a 5 V motor, below stiction, so the torque is nil but
+#            the bridge never drops out. The closest thing to "zero" the
+#            hardware can do safely.
+ZERO_MODE = 'min'
+DEAD_ZONE = 0.097
+# The smallest command that reaches DRV8830 register 0x06, its lowest legal
+# VSET: abcvlib's scaling gives 0x05 -- a reserved value -- for anything under
+# 0.111. Nothing about the dead zone itself.
+MIN_DRIVE = 0.13
+# Above this the IMU sample is not late, it is from a different moment: the
+# sensor handler is backed up. Normal is ~10 ms.
+STALE_SENSOR_MS = 250.0
 
 context = None  # Activity context, injected by abcvlib.py.
 
@@ -64,8 +171,27 @@ sensors = dict(
     battery_voltage=0.0, charger_voltage=0.0, coil_voltage=0.0,
 )
 
+# Onboard policy. When the trainer agrees at handshake, the policy runs here
+# and the trainer only receives experience and pushes weights back. The point
+# is not bandwidth -- the round trip already hides inside a control period --
+# it is that the action can be applied in the SAME tick as the observation
+# that produced it. Measured 2026-09-07, waiting for the trainer's reply cost a
+# full 20ms of a ~30ms sensor-to-torque budget, against a robot whose tilt
+# diverges with a ~50ms time constant. See docs/ONDEVICE_POLICY.md.
+onboard = False
+# Sticky across disconnects. `onboard` is negotiated per connection, but a
+# robot that is balancing must not have its wheels cut the moment the trainer
+# goes quiet -- stopping is what makes it fall over. Once a trainer has agreed
+# we hold the policy, we keep driving on the weights we have and reconnect in
+# the background.
+standalone = False
+runner = None
+
 sock = None
-stream = None
+# Own framing buffer instead of a buffered file object: the pipelined loop has
+# to ask "is an action here?" without blocking, which file.read cannot do.
+buffer = bytearray()
+pipeline = True
 imu_stamp = 0.0     # monotonic time of the last orientation callback
 imu_age_ms = 0.0    # sensor hardware time to callback, milliseconds
 step = 0
@@ -73,68 +199,85 @@ next_tick = 0.0
 last_attempt = 0.0
 last_report = 0.0
 last_gui = 0.0
+last_act = 0.0
 control_hz = 0.0
+drive_ms = 0.0    # cost of handing one action to the serial writer
+pace = PACE        # negotiated per connection
+last_drive = 0.0   # monotonic time of the previous drive(), for cycle_ms
+seq = 0            # observation sequence, echoed by the trainer in its action
+cycle_ms = 0.0     # time between the previous drive() and this one
+last_wait_ms = 0.0
+last_work_ms = 0.0
+last_command = (0.0, 0.0)
+t_drive = 0.0      # monotonic time of the last drive(), same clock as nanoTime
+t_dequeued = 0.0   # ~ when the writer sent it; the reply is due REPLY_MS later
+slew_max = SLEW_MAX
+zero_mode = ZERO_MODE
+wake_lead_ms = WAKE_LEAD_MS
+spin_wait = SPIN_WAIT
+spin_before_ms = SPIN_BEFORE_MS
+presample_ms = PRESAMPLE_MS
+trainer_presample_ms = TRAINER_PRESAMPLE_MS
+warm_ms = WARM_MS
+warm_n = 1
+prepare_ahead = PREPARE_AHEAD
+serial_ok = True          # the RP2040 answered within SERIAL_WAIT_MAX_MS
+last_serial_warning = 0.0
+last_stale_warning = 0.0
 
 
-class WheelSubscriber(dynamic_proxy(WheelDataSubscriber)):
-
-    def onWheelDataUpdate(self, timestamp, wheel_count_l, wheel_count_r,
-                          wheel_distance_l, wheel_distance_r,
-                          wheel_speed_instant_l, wheel_speed_instant_r,
-                          wheel_speed_buffered_l, wheel_speed_buffered_r,
-                          wheel_speed_exp_avg_l, wheel_speed_exp_avg_r):
-        sensors['wheel_count_l'] = float(wheel_count_l)
-        sensors['wheel_count_r'] = float(wheel_count_r)
-        sensors['wheel_distance_l'] = float(wheel_distance_l)
-        sensors['wheel_distance_r'] = float(wheel_distance_r)
-        # Instantaneous, not the exponential average. Wheel data arrives over
-        # serial at only ~5.5Hz, so an EMA at weight 0.1 has a time constant
-        # near 2s: measured, a 0.5s command produced 6s of reported wheel
-        # motion decaying 2098 -> 320 -> 86 -> 1. That lag is invisible in the
-        # logs but poisons any controller that reads wheel speed.
-        sensors['wheel_speed_l'] = float(wheel_speed_instant_l)
-        sensors['wheel_speed_r'] = float(wheel_speed_instant_r)
-
-
-class OrientationSubscriber(dynamic_proxy(OrientationDataSubscriber)):
-
-    def onOrientationUpdate(self, timestamp, theta_rad, angular_velocity_rad):
-        global imu_stamp, imu_age_ms
-        sensors['theta'] = float(theta_rad)
-        sensors['angular_velocity'] = float(angular_velocity_rad)
-        # `timestamp` is the hardware sensor-event time from the Android HAL,
-        # on the same clock as elapsedRealtimeNanos, so their difference is the
-        # true sensor-to-app age including any batching. This is the only way to
-        # measure pipeline delay without a synchronised external event: a
-        # constant lag is invisible in a trace of the signal itself.
-        imu_age_ms = (SystemClock.elapsedRealtimeNanos() - timestamp) / 1e6
-        imu_stamp = time.monotonic()
-
-
-class BatterySubscriber(dynamic_proxy(BatteryDataSubscriber)):
-
-    def onBatteryVoltageUpdate(self, timestamp, battery_voltage):
-        sensors['battery_voltage'] = float(battery_voltage)
-
-    def onChargerVoltageUpdate(self, timestamp, charger_voltage, coil_voltage):
-        sensors['charger_voltage'] = float(charger_voltage)
-        sensors['coil_voltage'] = float(coil_voltage)
+# The sensor subscribers live in Kotlin (SensorSnapshot.kt). They used to be
+# Python classes here, and every one of the ~200 orientation events a second
+# then crossed Chaquopy and took the GIL from the policy step: 3.5 ms per step
+# became 20-25 ms, and the sensor callbacks queued behind the policy in turn.
+# Python now reads one JSON snapshot per control step and enters no callback.
 
 
 def setup():
+    global runner
+    # Built before the first connection so the handshake can honestly say
+    # whether we can act on our own. With no weights on disk yet this is a
+    # runner that is not `ready`, and the trainer keeps the policy.
+    if PIN_CPUS:
+        try:
+            os.sched_setaffinity(0, set(PIN_CPUS))
+        except Exception as e:  # noqa: BLE001
+            print('dreamerBridge: could not pin the control thread: %s' % e)
+    from policy_runner import PolicyRunner
+    runner = PolicyRunner(os.path.join(weights_dir(), 'policy.npz'))
+    print('dreamerBridge: onboard policy %s' % (
+        'ready (%s)' % runner.stamp if runner.ready else 'absent'))
+    if runner.ready:
+        # Which stage dominates is a property of this phone, not of the port.
+        print('dreamerBridge: policy timing  %s' % runner.benchmark())
+        try:
+            import numpy as _np
+            blas = _np.show_config('dicts')['Build Dependencies']['blas']
+            print('dreamerBridge: numpy %s blas=%s' % (_np.__version__, blas))
+        except Exception as e:  # noqa: BLE001
+            print('dreamerBridge: numpy config unavailable: %s' % e)
+
+    # Diagnostic reference for the fused orientation signal. Registered before
+    # the publishers start, because that is when the listeners are attached.
+    SensorLatencyTrace.setGyro(True)
+    # Off by default; the trainer turns it on with a `ctrl` frame so the
+    # change can be measured against the blocking path in one session.
+    ControlLatencyTrace.useAsyncMotor(False)
+
     publisher_manager = PublisherManager()
 
+    snapshot = SensorSnapshot.subscriber()
     battery_data = BatteryData.Builder(context, publisher_manager).build()
-    battery_data.addSubscriber(BatterySubscriber())
+    battery_data.addSubscriber(snapshot)
 
     wheel_data = (WheelData.Builder(context, publisher_manager)
                   .setBufferLength(10)
                   .setExpWeight(0.5)
                   .build())
-    wheel_data.addSubscriber(WheelSubscriber())
+    wheel_data.addSubscriber(snapshot)
 
     (OrientationData.Builder(context, publisher_manager).build()
-     .addSubscriber(OrientationSubscriber()))
+     .addSubscriber(snapshot))
 
     publisher_manager.initializePublishers()
     publisher_manager.startPublishers()
@@ -146,14 +289,83 @@ def setup():
         BuildConfig.IP, BuildConfig.PORT))
 
 
+def sample():
+    """Take the sensors and the age of the sample that produced them, together.
+
+    Reading `sensors` field by field while the sensor thread writes it can mix
+    two different samples, and reading `imu_stamp` later -- as the timing block
+    used to -- dates the observation by a callback that had not happened yet
+    when the observation was taken. That is why `imu_stale_ms` was reported as
+    *negative*: an impossible number, and a warning that the timestamps were
+    not measuring what they claimed.
+    """
+    global last_stale_warning, imu_stamp, imu_age_ms
+    snap = json.loads(SensorSnapshot.snapshotJson())
+    imu_age_ms = snap.pop('imu_age_ms')
+    imu_stamp = snap.pop('imu_callback_s')
+    snap.pop('wheel_callback_s', None)
+    sensors.update(snap)  # for update_gui() and the idle display
+    # A sample this old means the sensor pipeline is backed up, not that the
+    # robot is slow: the control loop is running on a picture of the world
+    # that is seconds out of date, and nothing else will say so.
+    if imu_age_ms > STALE_SENSOR_MS and \
+            time.monotonic() - last_stale_warning > 5.0:
+        last_stale_warning = time.monotonic()
+        print('dreamerBridge: IMU sample is %.0f ms old -- the sensor pipeline '
+              'is backed up' % imu_age_ms)
+        context.guiUpdater.setTrainerStatus(
+            'STALE SENSORS: %.0f ms' % imu_age_ms)
+    return snap, imu_stamp, imu_age_ms
+
+
+def latency_block(taken_at, sensor_stamp, sensor_age_ms):
+    """Everything known about how old this observation is, and what the wheels
+    were actually told, in one place.
+
+    `drive()` returns as soon as the command is in the serial writer's one-slot
+    mailbox, so no phone-side timing before this covered the part that moves
+    the robot: the USB round trip to the RP2040, and the commands that get
+    overwritten in the mailbox before they are ever sent.
+    """
+    block = dict(
+        imu_age_ms=sensor_age_ms,
+        # Age of the sample the policy actually saw, measured at the instant it
+        # was taken rather than when the message was built.
+        imu_stale_ms=(taken_at - sensor_stamp) * 1e3 if sensor_stamp else -1.0,
+    )
+    # Both traces arrive as JSON: see ControlLatencyTrace.snapshotJson.
+    block.update(json.loads(ControlLatencyTrace.snapshotJson()))
+    block.update(json.loads(SensorLatencyTrace.snapshotJson()))
+    block['t_drive'] = t_drive
+    block['t_obs'] = taken_at
+    block['ser_ok'] = serial_ok
+    return block
+
+
 def loop():
     """One control step, or one reconnect attempt if we are not connected."""
-    global step, next_tick
+    global step, next_tick, last_act
     if sock is None:
+        if standalone and runner is not None and runner.ready:
+            # No trainer, but we still have the policy that was balancing a
+            # moment ago. Keep the loop closed and retry the connection between
+            # ticks; experience collected now is simply not recorded.
+            wait_for_pace()
+            snap, _, _ = sample()
+            _, act = runner.act(snap)
+            drive(act[0], act[1])
+            if prepare_ahead:
+                runner.prepare()
+            if time.monotonic() - last_attempt >= RETRY_DELAY:
+                context.guiUpdater.setTrainerStatus('standalone (no trainer)')
+                connect()
+            update_gui()
+            return
         # Keep refreshing the screen while idle, so the phone is a usable
         # sensor readout on its own and not only while a trainer is attached.
         # Connection attempts stay on their own slower cadence.
         stop_wheels()
+        sample()
         update_gui()
         if time.monotonic() - last_attempt >= RETRY_DELAY:
             connect()
@@ -161,36 +373,78 @@ def loop():
             time.sleep(IDLE_PERIOD)
         return
     try:
+        if onboard:
+            return loop_onboard()
+        if pace == 'serial':
+            return loop_trainer_serial()
         # Split the step so a stall can be attributed. wait_ms is time blocked
         # on the trainer, so it carries the network and the policy compute;
         # work_ms is purely local and should be a near-constant control period.
         # A spike in work_ms means the phone stalled (GC, CPU contention); a
         # spike only in wait_ms means the link or the trainer did.
         before_read = time.monotonic()
-        act = read()
-        after_read = time.monotonic()
-        if act['type'] != 'act':
-            raise ValueError('Expected an act message, got %r' % act['type'])
-        if act['reset']:
-            stop_wheels()
-            step = 0
+        if pipeline:
+            # Never block: take the newest action that has arrived and keep
+            # driving the last one otherwise. Anything older than the newest is
+            # already superseded, so applying it would only add delay.
+            act = None
+            while True:
+                frame = read_nowait()
+                if frame is None:
+                    break
+                header, blob = frame
+                if header.get('type') == 'weights':
+                    # Bootstrap: we came up without a policy, so the trainer is
+                    # still driving. Once its weights land we can take over,
+                    # but onboard mode is settled at handshake -- so drop the
+                    # link and let the next connect negotiate it.
+                    if runner.load_blob(blob, header.get('stamp'),
+                                        weights_dir()):
+                        print('dreamerBridge: got a policy, reconnecting to '
+                              'take over control')
+                        stop_wheels()
+                        disconnect()
+                        return
+                    continue
+                act = header
         else:
-            drive(act['left'], act['right'])
+            act = read()
+        after_read = time.monotonic()
+        if act is not None:
+            if act['type'] != 'act':
+                raise ValueError(
+                    'Expected an act message, got %r' % act['type'])
+            # The trainer scores the observation we just sent, so the reward
+            # that comes back with the next action is this state's.
+            apply_overrides(act)
+            context.guiUpdater.setReward(float(act.get('reward', 0.0)))
+            if act['reset']:
+                stop_wheels()
+                step = 0
+            else:
+                drive(act['left'], act['right'])
+            last_act = time.monotonic()
+        elif time.monotonic() - last_act > ACTION_TIMEOUT:
+            # The trainer has gone quiet. Coast rather than keep driving.
+            stop_wheels()
         wait_for_tick()
         before_write = time.monotonic()
+        snap, snap_stamp, snap_age = sample()
         write(dict(type='obs', step=step, t=time.time(),
+                   # True when this tick applied a new action rather than
+                   # repeating the previous one.
+                   fresh=act is not None,
                    wait_ms=(after_read - before_read) * 1e3,
                    work_ms=(before_write - after_read) * 1e3,
-                   # Two halves of the sensor pipeline: hardware to callback,
-                   # then callback to the moment we ship the observation.
-                   imu_age_ms=imu_age_ms,
-                   imu_stale_ms=(before_write - imu_stamp) * 1e3 if imu_stamp else -1.0,
-                   sensors=dict(sensors)))
+                   drive_ms=drive_ms,
+                   sensors=snap,
+                   **latency_block(before_write, snap_stamp, snap_age)))
         step += 1
     except Exception as e:
         print('dreamerBridge: lost the trainer at step %d: %s' % (step, e))
         context.guiUpdater.setTrainerStatus('disconnected (%s)' % e)
-        stop_wheels()
+        if not (standalone and runner is not None and runner.ready):
+            stop_wheels()
         disconnect()
     finally:
         update_gui()
@@ -226,9 +480,251 @@ def update_gui():
     gui.setWheelRightData('%d : %.2f : %.2f' % (
         sensors['wheel_count_r'], sensors['wheel_distance_r'],
         sensors['wheel_speed_r']))
+    gui.setLastAction('L %+.2f  R %+.2f' % last_command)
     gui.setStepInfo(str(step))
     gui.setControlHz(control_hz)
     gui.displayValues()
+
+
+def loop_onboard():
+    """One control step with the policy running here.
+
+    Order matters and is the whole point. The legacy path applies an action at
+    the top of a tick, sleeps, then samples and ships -- so the reply to an
+    observation lands a full period after it was taken. Here we pace first,
+    then sample, decide and drive back to back, so the gap between reading the
+    IMU and moving the wheels is just the network forward pass (~2-4ms on this
+    phone) instead of 20ms.
+
+    Everything that is not on that path -- shipping the transition, taking
+    resets, installing new weights -- happens afterwards, inside the slack of
+    the same tick.
+    """
+    global step, last_act, seq
+    before_tick = time.monotonic()
+    if pace == 'serial' and presample_ms and t_dequeued:
+        # Sleep-poll until the decision point, decide, then wait for the link.
+        due = t_dequeued + (REPLY_MS - presample_ms) / 1e3
+        while time.monotonic() < due:
+            if ControlLatencyTrace.serialIdleUs() >= 0:
+                break  # the reply came early; decide now
+            time.sleep(0.0005)
+        tick = time.monotonic()
+        snap, snap_stamp, snap_age = sample()
+        obs, act = runner.act(snap)
+        wait_for_serial()
+    else:
+        wait_for_pace()
+        tick = time.monotonic()
+        snap, snap_stamp, snap_age = sample()
+        obs, act = runner.act(snap)
+    drive(act[0], act[1])
+    applied = time.monotonic()
+    last_act = applied
+    seq += 1
+
+    write(dict(type='obs', step=step, seq=seq, t=time.time(), fresh=True,
+               pace=pace, cycle_ms=cycle_ms, lead_ms=wake_lead_ms,
+               serial_wait_ms=(tick - before_tick) * 1e3,
+               # The action we already applied. The trainer records this rather
+               # than one of its own: what the world model learns must be what
+               # the wheels actually did.
+               act=act,
+               is_first=runner.was_first,
+               # Same split as the legacy path, but here work_ms is the real
+               # decision cost, not a sleep: it is sample -> policy -> wheels.
+               wait_ms=(tick - before_tick) * 1e3,
+               work_ms=(applied - tick) * 1e3,
+               policy_ms=runner.last_ms,
+               warm_ms=runner.last_warm_ms,
+               prepare_ms=runner.last_prepare_ms,
+               prepared=runner.prepared,
+               drive_ms=drive_ms,
+               policy_stamp=runner.stamp,
+               sensors=snap,
+               **latency_block(tick, snap_stamp, snap_age)))
+    step += 1
+    drain_control()
+    # The GRU half of the next step needs only the carry we already have. Do
+    # it now, in the ~80 ms the RP2040 is busy, so that when the reply lands
+    # only the observation-dependent half is between the sensors and the
+    # wheels. drain_control() ran first: a reset there invalidates it.
+    if prepare_ahead:
+        runner.prepare()
+
+
+def loop_trainer_serial():
+    """One control step, trainer-driven, paced on the serial link.
+
+    The microcontroller is free the instant its reply lands, so that is when
+    the observation is taken and shipped. The trainer's action normally comes
+    back within ~10 ms, before the firmware's next USB poll; we hold the free
+    link for it up to ACT_WAIT_MS and otherwise repeat the last action rather
+    than let the microcontroller idle. Sensor-to-torque is therefore the
+    network round trip plus the policy, and every action is applied.
+    """
+    global step, last_act, seq
+    if trainer_presample_ms and t_dequeued:
+        # Ship the observation before the link is free, so the action is back
+        # when it is. If the reply comes early, ship now.
+        due = t_dequeued + (REPLY_MS - trainer_presample_ms) / 1e3
+        t0 = time.monotonic()
+        while time.monotonic() < due:
+            if ControlLatencyTrace.serialIdleUs() >= 0:
+                break
+            time.sleep(0.0005)
+        serial_wait_ms = (time.monotonic() - t0) * 1e3
+    else:
+        serial_wait_ms = wait_for_serial()
+    tick = time.monotonic()
+    snap, snap_stamp, snap_age = sample()
+    seq += 1
+    write(dict(type='obs', step=step, seq=seq, t=time.time(), fresh=True,
+               pace=pace, cycle_ms=cycle_ms,
+               serial_wait_ms=serial_wait_ms,
+               wait_ms=last_wait_ms, work_ms=last_work_ms,
+               drive_ms=drive_ms, sensors=snap,
+               **latency_block(tick, snap_stamp, snap_age)))
+    step += 1
+
+    # Wait for the action to this observation. A trainer that echoes `seq`
+    # lets us tell it from a late reply to the previous one; one that does not
+    # is taken at its word.
+    act = None
+    deadline = tick + ACT_WAIT_MS / 1e3
+    while True:
+        frame = read_nowait()
+        while frame is not None:
+            header, blob = frame
+            kind = header.get('type')
+            if kind == 'weights':
+                if runner.load_blob(blob, header.get('stamp'), weights_dir()):
+                    print('dreamerBridge: got a policy, reconnecting to '
+                          'take over control')
+                    stop_wheels()
+                    disconnect()
+                    return
+            elif kind == 'act' and header.get('seq', seq) == seq:
+                act = header
+            frame = read_nowait()
+        if act is not None or time.monotonic() >= deadline:
+            break
+        time.sleep(0.0005)
+    got = time.monotonic()
+    if trainer_presample_ms:
+        wait_for_serial()
+
+    if act is not None:
+        apply_overrides(act)
+        context.guiUpdater.setReward(float(act.get('reward', 0.0)))
+        last_act = got
+        if act['reset']:
+            stop_wheels()
+            step = 0
+        else:
+            drive(act['left'], act['right'])
+    elif time.monotonic() - last_act > ACTION_TIMEOUT:
+        # The trainer has gone quiet. Coast rather than keep driving.
+        stop_wheels()
+    else:
+        # Late: repeat the previous command so the link is not left idle.
+        drive(*last_command)
+    record_split((got - tick) * 1e3, (time.monotonic() - got) * 1e3)
+
+
+def record_split(wait, work):
+    """Keep this cycle's timing for the next frame: the observation goes out
+    before the action that answers it is known."""
+    global last_wait_ms, last_work_ms
+    last_wait_ms, last_work_ms = wait, work
+
+
+def drain_control():
+    """Take whatever the trainer has sent, without blocking the control loop.
+
+    Resets and weight updates are not latency critical, so they are handled
+    after the wheels have already been driven for this tick. A weight blob is
+    megabytes and arrives over many ticks; parse() only yields it once it is
+    whole, so a partial one simply sits in the buffer.
+    """
+    global step
+    budget = time.monotonic() + 0.004
+    while time.monotonic() < budget:
+        frame = read_nowait()
+        if frame is None:
+            break
+        header, blob = frame
+        kind = header.get('type')
+        if kind == 'weights':
+            stamp = header.get('stamp')
+            if runner.load_blob(blob, stamp, weights_dir()):
+                print('dreamerBridge: policy updated to %s' % stamp)
+                context.guiUpdater.setTrainerStatus('policy %s' % stamp)
+        elif kind in ('act', 'ctrl'):
+            apply_overrides(header)
+            context.guiUpdater.setReward(float(header.get('reward', 0.0)))
+            if header.get('reset'):
+                # The trainer owns episode boundaries; it is the side that
+                # knows the length and the termination rule. Only the timing
+                # is relaxed -- a reset one tick late costs nothing, unlike an
+                # action one tick late.
+                stop_wheels()
+                runner.reset()
+                step = 0
+
+
+def weights_dir():
+    return os.path.join(str(context.getFilesDir()), 'dreamer_policy')
+
+
+def wait_for_pace():
+    """Block until it is time to decide: see PACE."""
+    if pace == 'serial':
+        wait_for_serial()
+    else:
+        wait_for_tick()
+
+
+def wait_for_serial():
+    """Block until the RP2040 has answered the previous command, then until it
+    is about to poll USB again. Returns how long that took, in ms."""
+    global serial_ok, last_serial_warning
+    t0 = time.monotonic()
+    deadline = t0 + SERIAL_WAIT_MAX_MS / 1e3
+    warmed = False
+    while True:
+        idle_us = ControlLatencyTrace.serialIdleUs()
+        if idle_us >= 0:
+            serial_ok = True
+            break
+        if warm_ms and not warmed and onboard and runner is not None and \
+                runner.ready and t_dequeued and \
+                time.monotonic() - t_dequeued >= (REPLY_MS - warm_ms) / 1e3:
+            warmed = True
+            for _ in range(warm_n):
+                runner.warm()
+            continue
+        if time.monotonic() >= deadline:
+            serial_ok = False
+            if time.monotonic() - last_serial_warning > 5.0:
+                last_serial_warning = time.monotonic()
+                print('dreamerBridge: no reply from the RP2040 for %.0f ms; '
+                      'carrying on without it' % SERIAL_WAIT_MAX_MS)
+                context.guiUpdater.setTrainerStatus('SERIAL LINK DOWN')
+            return (time.monotonic() - t0) * 1e3
+        near = spin_before_ms and t_dequeued and \
+            time.monotonic() - t_dequeued >= (REPLY_MS - spin_before_ms) / 1e3
+        if not spin_wait and not near:
+            time.sleep(0.001)
+    remaining = wake_lead_ms / 1e3 - idle_us / 1e6
+    if remaining > 0:
+        if spin_wait:
+            until = time.monotonic() + remaining
+            while time.monotonic() < until:
+                ControlLatencyTrace.serialIdleUs()
+        else:
+            time.sleep(remaining)
+    return (time.monotonic() - t0) * 1e3
 
 
 def wait_for_tick():
@@ -246,9 +742,90 @@ def wait_for_tick():
         time.sleep(remaining)
 
 
+def apply_overrides(header):
+    """Per-frame knobs the trainer may set, mostly for experiments."""
+    global slew_max, zero_mode, wake_lead_ms, spin_wait
+    if 'spin' in header:
+        spin_wait = bool(header['spin'])
+    if 'warm' in header:
+        global warm_ms
+        warm_ms = float(header['warm'])
+    if 'warm_n' in header:
+        global warm_n
+        warm_n = int(header['warm_n'])
+    if 'prepare' in header:
+        global prepare_ahead
+        prepare_ahead = bool(header['prepare'])
+    if 'spin_before' in header:
+        global spin_before_ms
+        spin_before_ms = float(header['spin_before'])
+    if 'presample' in header:
+        global presample_ms
+        presample_ms = float(header['presample'])
+    if 'trainer_presample' in header:
+        global trainer_presample_ms
+        trainer_presample_ms = float(header['trainer_presample'])
+    if 'cpus' in header:
+        # Pin the control thread. On the Pixel 3a CPUs 6-7 are the A75s.
+        try:
+            os.sched_setaffinity(0, set(int(c) for c in header['cpus']))
+            print('dreamerBridge: control thread pinned to %s' % header['cpus'])
+        except Exception as e:  # noqa: BLE001
+            print('dreamerBridge: could not pin: %s' % e)
+    if 'prio' in header:
+        try:
+            from android.os import Process
+            Process.setThreadPriority(int(header['prio']))
+            print('dreamerBridge: control thread priority %s' % header['prio'])
+        except Exception as e:  # noqa: BLE001
+            print('dreamerBridge: could not set priority: %s' % e)
+    if 'bench' in header and header['bench'] and runner is not None:
+        # The same benchmark as at startup, but with the sensors live.
+        print('dreamerBridge: policy timing (live)  %s' % runner.benchmark())
+    if 'async_motor' in header:
+        ControlLatencyTrace.useAsyncMotor(bool(header['async_motor']))
+    if 'slew' in header:
+        slew_max = float(header['slew'])
+    if 'zero' in header:
+        zero_mode = str(header['zero'])
+    if 'lead' in header:
+        wake_lead_ms = float(header['lead'])
+
+
+def zero_fix(value, previous):
+    """(value, brake) for one wheel under ZERO_MODE."""
+    if abs(value) >= DEAD_ZONE:
+        return value, False
+    if zero_mode == 'brake':
+        return 0.0, True
+    sign = 1.0 if previous >= 0 else -1.0
+    return sign * MIN_DRIVE, False
+
+
 def drive(left, right):
-    context.outputs.setWheelOutput(float(left), float(right), False, False)
-    context.guiUpdater.setLastAction('L %+.2f  R %+.2f' % (left, right))
+    """Hand an action to the wheels, and time what that costs us.
+
+    This only reaches the serial writer's mailbox; the wheels move whenever the
+    writer wins its round trip with the RP2040. `drive_ms` is therefore a floor
+    on the actuation delay, not the whole of it -- see `ser_service_ms`.
+    """
+    global drive_ms, last_drive, cycle_ms, last_command, t_drive, t_dequeued
+    requested = (float(left), float(right))
+    t0 = time.monotonic()
+    left, right = float(left), float(right)
+    lb = rb = False
+    if zero_mode != 'coast':
+        left, lb = zero_fix(left, last_command[0])
+        right, rb = zero_fix(right, last_command[1])
+    context.outputs.setWheelOutput(left, right, lb, rb, float(slew_max))
+    last_command = requested
+    drive_ms = (time.monotonic() - t0) * 1e3
+    cycle_ms = (t0 - last_drive) * 1e3 if last_drive else 0.0
+    last_drive = t0
+    t_drive = t0
+    t_dequeued = t0 + 0.0005  # the writer picks it up in ~0.4 ms
+    # The screen is refreshed by update_gui() at its own rate; a string format
+    # and a UI-thread hop do not belong between the wheels and the next step.
 
 
 def stop_wheels():
@@ -259,7 +836,7 @@ def stop_wheels():
 
 def connect():
     """Try once to reach the trainer, without blocking the loop for long."""
-    global sock, stream, last_attempt, next_tick
+    global sock, last_attempt, next_tick, pipeline, last_act
     last_attempt = time.monotonic()
     address = (BuildConfig.IP, BuildConfig.PORT)
     try:
@@ -267,15 +844,37 @@ def connect():
         # Reads block for much longer than the connect handshake may.
         candidate.settimeout(RECV_TIMEOUT)
         candidate.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        sock, stream = candidate, candidate.makefile('rb')
+        sock = candidate
+        buffer.clear()
         write(dict(type='hello', protocol=PROTOCOL, control_hz=CONTROL_HZ,
-                   robot_id=ROBOT_ID))
+                   robot_id=ROBOT_ID, onboard=bool(runner and runner.ready),
+                   policy_stamp=(runner.stamp if runner else None),
+                   pace=PACE))
         hello = read()
         if hello['type'] != 'hello' or hello['protocol'] != PROTOCOL:
             raise ValueError('Unexpected handshake %r' % hello)
+        pipeline = bool(hello.get('pipeline', True))
+        # Both ends must agree. We only offer it if the weights actually
+        # loaded; the trainer only accepts if it is configured to record our
+        # actions rather than send its own.
+        global onboard, standalone, pace
+        pace = hello.get('pace', PACE)
+        if pace not in ('serial', 'clock'):
+            raise ValueError('Unknown pacing %r' % pace)
+        onboard = bool(hello.get('onboard', False)) and runner.ready
+        if onboard:
+            standalone = True
+            runner.reset()
         next_tick = 0.0
-        print('dreamerBridge: connected to %s:%d' % address)
-        context.guiUpdater.setTrainerStatus('connected to %s:%d' % address)
+        last_act = time.monotonic()
+        # cycle_ms is drive-to-drive; the first one of a session would
+        # otherwise measure back to whatever the previous session did last.
+        global last_drive
+        last_drive = 0.0
+        mode = ('pipelined' if pipeline else 'lock-step') + ', ' + pace + ' paced'
+        print('dreamerBridge: connected to %s:%d (%s)' % (address + (mode,)))
+        context.guiUpdater.setTrainerStatus(
+            'connected to %s:%d (%s)' % (address + (mode,)))
     except Exception as e:
         print('dreamerBridge: cannot reach %s:%d: %s' % (address + (e,)))
         context.guiUpdater.setTrainerStatus('no trainer at %s:%d' % address)
@@ -283,13 +882,13 @@ def connect():
 
 
 def disconnect():
-    global sock, stream
-    for handle in (stream, sock):
-        try:
-            handle and handle.close()
-        except OSError:
-            pass
-    sock, stream = None, None
+    global sock
+    try:
+        sock and sock.close()
+    except OSError:
+        pass
+    sock = None
+    buffer.clear()
 
 
 def write(header, blob=b''):
@@ -299,16 +898,66 @@ def write(header, blob=b''):
 
 
 def read():
-    length, = struct.unpack('>I', readexactly(4))
-    header = json.loads(readexactly(length).decode('utf-8'))
-    readexactly(header.get('blob_len', 0))  # Unused until camera frames land.
-    return header
+    """Block for the next complete frame. Returns the header only."""
+    while True:
+        frame = parse()
+        if frame is not None:
+            return frame[0]
+        fill(block=True)
 
 
-def readexactly(amount):
-    if not amount:
-        return b''
-    data = stream.read(amount)
-    if data is None or len(data) < amount:
+def read_nowait():
+    """The next complete frame if it is already here, else None.
+
+    Returns (header, blob). A weight update spans many recv() calls, so this
+    keeps pulling until the socket is drained rather than taking one 64KB
+    bite per control tick -- at 50Hz that would stretch a 5MB update over
+    nearly two seconds.
+    """
+    frame = parse()
+    if frame is not None:
+        return frame
+    while fill(block=False):
+        frame = parse()
+        if frame is not None:
+            return frame
+    return None
+
+
+def parse():
+    """Pull one frame out of the buffer, leaving a partial one in place.
+
+    Returns (header, blob) or None. The blob used to be skipped; it now
+    carries policy weight updates, which are megabytes, so a frame is only
+    complete once all of it has arrived.
+    """
+    if len(buffer) < 4:
+        return None
+    length, = struct.unpack('>I', buffer[:4])
+    if len(buffer) < 4 + length:
+        return None
+    header = json.loads(bytes(buffer[4:4 + length]).decode('utf-8'))
+    blob_len = header.get('blob_len', 0)
+    total = 4 + length + blob_len
+    if len(buffer) < total:
+        return None
+    blob = bytes(buffer[4 + length:total]) if blob_len else b''
+    del buffer[:total]
+    return header, blob
+
+
+def fill(block):
+    """Read whatever the socket has; True if any bytes arrived."""
+    sock.settimeout(RECV_TIMEOUT if block else 0.0)
+    try:
+        chunk = sock.recv(65536)
+    except (BlockingIOError, InterruptedError):
+        return False
+    except socket.timeout:
+        raise ConnectionError('Trainer went quiet')
+    finally:
+        sock.settimeout(RECV_TIMEOUT)
+    if not chunk:
         raise ConnectionError('Trainer closed the connection')
-    return data
+    buffer.extend(chunk)
+    return True

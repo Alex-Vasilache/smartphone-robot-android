@@ -13,6 +13,8 @@ import android.os.HandlerThread
 import jp.oist.abcvlib.core.inputs.Publisher
 import jp.oist.abcvlib.core.inputs.PublisherManager
 import jp.oist.abcvlib.util.Logger
+import jp.oist.abcvlib.util.SensorLatencyTrace
+import android.os.SystemClock
 
 /**
  * MotionSensors reads and processes the data from the Android phone gyroscope and
@@ -132,6 +134,20 @@ class OrientationData(context: Context, publisherManager: PublisherManager) :
     override fun onSensorChanged(event: SensorEvent) {
         val sensor = event.sensor
 
+        if (sensor.type == TYPE_GYROSCOPE) {
+            // Diagnostic only: nothing downstream consumes this. It exists so
+            // the fused rotation vector can be compared against a signal that
+            // has no fusion filter in front of it.
+            SensorLatencyTrace.gyroX = event.values[0]
+            SensorLatencyTrace.gyroY = event.values[1]
+            SensorLatencyTrace.gyroZ = event.values[2]
+            SensorLatencyTrace.gyroAgeMs =
+                (SystemClock.elapsedRealtimeNanos() - event.timestamp) / 1e6
+            SensorLatencyTrace.gyroCallbackNs = System.nanoTime()
+            SensorLatencyTrace.gyroCount++
+            return
+        }
+
         // if(sensor.getType()==Sensor.TYPE_GYROSCOPE){
         // indexCurrentGyro = sensorChangeCountGyro % windowLength;
         // indexPreviousGyro = (sensorChangeCountGyro - 1) % windowLength;
@@ -166,6 +182,14 @@ class OrientationData(context: Context, publisherManager: PublisherManager) :
             thetaRad[indexCurrentRotation] = orientation[1].toDouble() //Pitch
             angularVelocityRad[indexCurrentRotation] =
                 (thetaRad[indexCurrentRotation] - thetaRad[indexPreviousRotation]) / dt
+
+            // Both clock bases, so the age can be checked rather than believed.
+            SensorLatencyTrace.rotAgeMs =
+                (SystemClock.elapsedRealtimeNanos() - event.timestamp) / 1e6
+            SensorLatencyTrace.rotAgeUptimeMs =
+                (System.nanoTime() - event.timestamp) / 1e6
+            SensorLatencyTrace.rotCallbackNs = System.nanoTime()
+            SensorLatencyTrace.rotCount++
 
             // Update all previous variables with current ones
             sensorChangeCountRotation++
@@ -208,6 +232,9 @@ class OrientationData(context: Context, publisherManager: PublisherManager) :
         } else {
             Logger.e("SensorTesting", "No rotation vector sensor available")
         }
+        if (SensorLatencyTrace.gyroEnabled && gyroscope != null) {
+            sensorManager.registerListener(this, gyroscope, SAMPLING_PERIOD_US, handler)
+        }
     }
 
     fun unregister() {
@@ -239,7 +266,16 @@ class OrientationData(context: Context, publisherManager: PublisherManager) :
     }
 
     override fun start() {
-        mHandlerThread = HandlerThread("sensorThread")
+        // Urgent priority, not the default. Measured 2026-09-07, an
+        // orientation event reaches this callback ~7.4ms after its hardware
+        // timestamp, of which only ~2.5ms is sampling aliasing (the sensor
+        // reports maxRate=200Hz, no batching, so 5000us is already its
+        // ceiling -- SENSOR_DELAY_FASTEST would change nothing). The rest is
+        // delivery, and a default-priority HandlerThread competing with the
+        // control loop is part of it. This is latency on the critical path of
+        // a balancing robot, where the whole budget is ~30ms.
+        mHandlerThread = HandlerThread(
+            "sensorThread", android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY)
         mHandlerThread.start()
         handler = Handler(mHandlerThread.looper)
         register(handler)

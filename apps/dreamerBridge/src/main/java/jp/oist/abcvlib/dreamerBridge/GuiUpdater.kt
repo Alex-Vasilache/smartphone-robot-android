@@ -16,6 +16,9 @@ class GuiUpdater(
 ) {
     private val df = DecimalFormat("#.00")
 
+    /** Rewards run small and can be negative, so they need a leading zero. */
+    private val rewardFormat = DecimalFormat("0.000")
+
     @Volatile
     var batteryVoltage: Double = 0.0
 
@@ -30,6 +33,10 @@ class GuiUpdater(
 
     @Volatile
     var angularVelocityDeg: Double = 0.0
+
+    /** Reward the trainer scored for the state we last reported. */
+    @Volatile
+    var reward: Double = 0.0
 
     @Volatile
     var wheelLeftData: String = ""
@@ -60,6 +67,7 @@ class GuiUpdater(
             binding.coilVoltageText.text = df.format(coilVoltage)
             binding.tiltAngle.text = df.format(thetaDeg)
             binding.angularVelcoity.text = df.format(angularVelocityDeg)
+            binding.reward.text = rewardFormat.format(reward)
             binding.leftWheelData.text = wheelLeftData
             binding.rightWheelData.text = wheelRightData
             binding.soundData.text = stepInfo

@@ -3,6 +3,7 @@
     <string name="voltageBatteryHeader">Battery Voltage: </string>
     <string name="voltageChargerHeader">Charger Voltage: </string>
     <string name="tiltAngleHeader">Tilt Angle (deg): </string>
+    <string name="rewardHeader">Reward: </string>
     <string name="angularVelocityHeader">Angular Velocity (deg/s): </string>
     <string name="leftWheelHeader">Left Wheel C:D:S </string>
     <string name="rightWheelHeader">Right Wheel C:D:S </string>

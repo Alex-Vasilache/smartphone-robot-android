@@ -130,6 +130,14 @@ class UsbSerial @Throws(IOException::class) constructor(
             port.dtr = true
             this.port = port
             val usbIoManager = SerialInputOutputManager(port, this)
+            // Do NOT bound the reader's timeout. It looks like it should help
+            // -- the reader holds the USB connection inside bulkTransfer, so
+            // in principle a write waits behind it -- but measured
+            // 2026-09-10 it does not: writes took 0.86ms with the reader
+            // parked, so there is no contention to fix. What a 20ms read
+            // timeout *did* do was lose reply bytes between transfers, so
+            // packets stopped assembling, awaitPacketReceived hit its 10s
+            // ceiling, and the effective command rate fell from 12Hz to 2.3Hz.
             // Adding this as there doesn't appear to be any call back in the usbIoManager that
             // will call onSerialReady after initialization. As it stands, there were things occurring
             // in onSerialReady that were being executed before the usbIoManager was initialized.
@@ -158,6 +166,7 @@ class UsbSerial @Throws(IOException::class) constructor(
     }
 
     override fun onNewData(data: ByteArray) {
+        ControlLatencyTrace.markData()
         // TODO I feel this should be executed in a separate thread otherwise the
         // SerialInputOutputManager thread may be delayed and miss data
 
@@ -189,7 +198,22 @@ class UsbSerial @Throws(IOException::class) constructor(
     @Throws(IOException::class)
     internal fun send(packet: ByteArray, timeout: Int) {
         port.write(packet, timeout)
+        ControlLatencyTrace.markSend()
         Logger.i(Thread.currentThread().name, "send() bytes=${HexBinConverters.bytesToHex(packet)}")
+    }
+
+    /**
+     * Write without clearing the parser or waiting for a reply.
+     *
+     * The wheels do not need the reply: it carries encoder counts and battery
+     * voltage, which are telemetry. Keeping the parser running instead of
+     * resetting it before every command is what makes that safe -- replies
+     * still arrive and are still parsed, just not waited for.
+     */
+    @Throws(IOException::class)
+    internal fun sendOnly(packet: ByteArray) {
+        port.write(packet, 200)
+        ControlLatencyTrace.markSend()
     }
 
     internal fun prepareForCommand(expectedCommand: AndroidToRP2040Command?) {
