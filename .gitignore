@@ -17,3 +17,4 @@ config.json
 # Signing secrets
 *.jks
 *.keystore
+config.json.bak
