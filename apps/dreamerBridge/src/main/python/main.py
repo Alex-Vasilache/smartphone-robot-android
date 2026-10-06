@@ -225,6 +225,7 @@ control_hz = 0.0
 drive_ms = 0.0    # cost of handing one action to the serial writer
 pace = PACE        # negotiated per connection
 max_hz = MAX_HZ    # negotiated per connection
+cmd_scale = 1.0    # every wheel command is multiplied by this (trainer's hello)
 reward_avg = 0.0   # display only, see note_reward
 ep_return = 0.0
 ep_steps = 0
@@ -898,9 +899,11 @@ def drive(left, right):
     on the actuation delay, not the whole of it -- see `ser_service_ms`.
     """
     global drive_ms, last_drive, cycle_ms, last_command, t_drive, t_dequeued
-    requested = (float(left), float(right))
+    # The policy acts in [-1, 1]; the trainer may cap the motors below full
+    # power (env.robot.command_scale) without shrinking the policy's range.
+    left, right = float(left) * cmd_scale, float(right) * cmd_scale
+    requested = (left, right)
     t0 = time.monotonic()
-    left, right = float(left), float(right)
     lb = rb = False
     if zero_mode != 'coast':
         left, lb = zero_fix(left, last_command[0])
@@ -972,6 +975,8 @@ def connect():
         # actions rather than send its own.
         global onboard, standalone, pace
         pace = hello.get('pace', PACE)
+        global cmd_scale
+        cmd_scale = float(hello.get('cmd_scale', 1.0))
         max_hz = float(hello.get('max_hz', settings['max_hz']))
         if pace not in ('serial', 'clock'):
             raise ValueError('Unknown pacing %r' % pace)
