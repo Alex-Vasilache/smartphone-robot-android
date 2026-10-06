@@ -25,8 +25,15 @@ Wire format, both directions: a 4-byte big-endian header length, a UTF-8 JSON
 header, then `blob_len` bytes of binary payload. The blob is unused while the
 observation is proprio only; it is where camera frames go.
 
-Set the trainer address in `config.json` at the repository root (copy
-`config.template.json`); it is compiled into `BuildConfig.IP`/`PORT`.
+The trainer address defaults to `config.json` at the repository root (copy
+`config.template.json`), compiled into `BuildConfig.IP`/`PORT`. A
+`trainer.json` pushed with adb overrides it without a rebuild, and is reread
+on every connection attempt:
+
+    adb push trainer.json /sdcard/Android/data/jp.oist.abcvlib.dreamerBridge/files/
+
+with `{"ip": "10.210.28.40", "port": 3000, "max_hz": 25}`; every key is
+optional.
 """
 
 import json
@@ -68,6 +75,12 @@ ACTION_TIMEOUT = 1.0
 # How often the idle loop refreshes the display while waiting for a trainer.
 IDLE_PERIOD = 0.05
 ROBOT_ID = 1
+# Serial pacing runs as fast as the RP2040 answers. On the stock firmware that
+# is ~11 Hz; on the fast firmware (RTT-LoopReduction) it can exceed 50 Hz,
+# which shortens the return horizon in seconds and, in the real-time cartpole
+# sim, lost reacher_easy. Cap the decision rate here. 0 disables. trainer.json
+# and the trainer's handshake may override it.
+MAX_HZ = 25.0
 # How the control loop paces itself. 'serial': one decision per RP2040 command
 # cycle, taken the moment the previous reply lands -- the only instant a new
 # command is applied promptly, because the microcontroller reads USB only
@@ -121,6 +134,12 @@ PREPARE_AHEAD = True
 # still reported, with `ser_ok` false, and the command is queued for when the
 # link comes back.
 SERIAL_WAIT_MAX_MS = 250.0
+# How long the serial writer waits for the RP2040's reply before sending the
+# next command anyway. The fast firmware answers in ~8 ms (p95 ~10, max ~16
+# on 2026-10-06), and with abcvlib's 10 s default one lost reply froze the
+# wheels for 10 s. Raise to ~1500 for the stock firmware, which stalls ~1.1 s
+# after a coast.
+REPLY_TIMEOUT_MS = 250
 # Run a throwaway policy step this many ms before the RP2040's reply is due,
 # so the real one runs on a warm core. The step costs 3.5 ms hot and 10 ms
 # cold on this phone (measured 2026-09-16, sensors already off the GIL and the
@@ -128,7 +147,7 @@ SERIAL_WAIT_MAX_MS = 250.0
 # firmware's first USB poll after its reply, which costs a whole extra poll
 # per cycle. The reply lands ~81 ms after the previous dequeue, p95 87.
 # 0 disables.
-WARM_MS = 14.0
+WARM_MS = 6.0
 # Typical dequeue -> reply on this firmware; only used to time the warm-up.
 REPLY_MS = 81.0
 # Largest change in wheel command per drive() call, passed to
@@ -203,6 +222,8 @@ last_act = 0.0
 control_hz = 0.0
 drive_ms = 0.0    # cost of handing one action to the serial writer
 pace = PACE        # negotiated per connection
+max_hz = MAX_HZ    # negotiated per connection
+next_slot = 0.0    # monotonic time of the next decision when max_hz caps it
 last_drive = 0.0   # monotonic time of the previous drive(), for cycle_ms
 seq = 0            # observation sequence, echoed by the trainer in its action
 cycle_ms = 0.0     # time between the previous drive() and this one
@@ -282,11 +303,13 @@ def setup():
     publisher_manager.initializePublishers()
     publisher_manager.startPublishers()
 
-    context.setSerialCommManager(
-        SerialCommManager(context.usbSerial, battery_data, wheel_data))
+    serial = SerialCommManager(context.usbSerial, battery_data, wheel_data)
+    serial.setReplyTimeoutMs(REPLY_TIMEOUT_MS)
+    context.setSerialCommManager(serial)
     context.onSetupReady()
-    context.guiUpdater.setTrainerStatus('connecting to %s:%d' % (
-        BuildConfig.IP, BuildConfig.PORT))
+    settings = trainer_settings()
+    context.guiUpdater.setTrainerStatus('connecting to %s:%s' % (
+        settings['ip'], settings['port']))
 
 
 def sample():
@@ -474,14 +497,15 @@ def update_gui():
     gui.setCoilVoltage(sensors['coil_voltage'])
     gui.setThetaDeg(math.degrees(sensors['theta']))
     gui.setAngularVelocityDeg(math.degrees(sensors['angular_velocity']))
-    gui.setWheelLeftData('%d : %.2f : %.2f' % (
-        sensors['wheel_count_l'], sensors['wheel_distance_l'],
-        sensors['wheel_speed_l']))
-    gui.setWheelRightData('%d : %.2f : %.2f' % (
-        sensors['wheel_count_r'], sensors['wheel_distance_r'],
-        sensors['wheel_speed_r']))
-    gui.setLastAction('L %+.2f  R %+.2f' % last_command)
-    gui.setStepInfo(str(step))
+    gui.setGyroDeg(math.degrees(SensorLatencyTrace.INSTANCE.getGyroX()))
+    gui.setWheelSpeedL(float(sensors['wheel_speed_l']))
+    gui.setWheelSpeedR(float(sensors['wheel_speed_r']))
+    gui.setWheelCountL(int(sensors['wheel_count_l']))
+    gui.setWheelCountR(int(sensors['wheel_count_r']))
+    gui.setActionL(float(last_command[0]))
+    gui.setActionR(float(last_command[1]))
+    gui.setLastAction('')
+    gui.setStep(int(step))
     gui.setControlHz(control_hz)
     gui.displayValues()
 
@@ -564,7 +588,12 @@ def loop_trainer_serial():
     network round trip plus the policy, and every action is applied.
     """
     global step, last_act, seq
-    if trainer_presample_ms and t_dequeued:
+    if max_hz > 0:
+        # The link is free long before the slot; ship the observation
+        # TRAINER_PRESAMPLE_MS ahead of it, so it is fresh and the action is
+        # back in time. The second wait_for_serial below holds to the slot.
+        serial_wait_ms = wait_for_serial(trainer_presample_ms)
+    elif trainer_presample_ms and t_dequeued:
         # Ship the observation before the link is free, so the action is back
         # when it is. If the reply comes early, ship now.
         due = t_dequeued + (REPLY_MS - trainer_presample_ms) / 1e3
@@ -611,7 +640,7 @@ def loop_trainer_serial():
             break
         time.sleep(0.0005)
     got = time.monotonic()
-    if trainer_presample_ms:
+    if trainer_presample_ms or max_hz > 0:
         wait_for_serial()
 
     if act is not None:
@@ -685,9 +714,10 @@ def wait_for_pace():
         wait_for_tick()
 
 
-def wait_for_serial():
+def wait_for_serial(lead_ms=0.0):
     """Block until the RP2040 has answered the previous command, then until it
-    is about to poll USB again. Returns how long that took, in ms."""
+    is about to poll USB again, then, under a max_hz cap, until `lead_ms`
+    before the next decision slot. Returns how long that took, in ms."""
     global serial_ok, last_serial_warning
     t0 = time.monotonic()
     deadline = t0 + SERIAL_WAIT_MAX_MS / 1e3
@@ -697,8 +727,8 @@ def wait_for_serial():
         if idle_us >= 0:
             serial_ok = True
             break
-        if warm_ms and not warmed and onboard and runner is not None and \
-                runner.ready and t_dequeued and \
+        if warm_ms and not warmed and not max_hz and onboard and \
+                runner is not None and runner.ready and t_dequeued and \
                 time.monotonic() - t_dequeued >= (REPLY_MS - warm_ms) / 1e3:
             warmed = True
             for _ in range(warm_n):
@@ -724,7 +754,29 @@ def wait_for_serial():
                 ControlLatencyTrace.serialIdleUs()
         else:
             time.sleep(remaining)
+    if max_hz > 0 and next_slot:
+        wait_for_slot(next_slot - lead_ms / 1e3)
     return (time.monotonic() - t0) * 1e3
+
+
+def wait_for_slot(target):
+    """Sleep until `target`, warming the policy core just before it.
+
+    With the fast firmware the RP2040 answers in ~8 ms, so under a 25 Hz cap
+    the loop idles ~30 ms per cycle and the core cools: measured 2026-10-06,
+    6.1 ms per policy step against 3.35 ms warm. Warm it WARM_MS before the
+    slot, the same trick the 81 ms firmware got from timing off its reply.
+    """
+    if warm_ms and onboard and runner is not None and runner.ready:
+        remaining = target - warm_ms / 1e3 - time.monotonic()
+        if remaining > 0:
+            time.sleep(remaining)
+        if time.monotonic() < target:
+            for _ in range(warm_n):
+                runner.warm()
+    remaining = target - time.monotonic()
+    if remaining > 0:
+        time.sleep(remaining)
 
 
 def wait_for_tick():
@@ -822,6 +874,16 @@ def drive(left, right):
     drive_ms = (time.monotonic() - t0) * 1e3
     cycle_ms = (t0 - last_drive) * 1e3 if last_drive else 0.0
     last_drive = t0
+    if max_hz > 0:
+        # Decisions sit on a fixed grid, so drive-to-drive is the period and
+        # not the period plus the decision's own cost. Fallen a whole period
+        # behind (a stall), start the grid again rather than burst.
+        global next_slot
+        period = 1.0 / max_hz
+        if next_slot and t0 - next_slot < period:
+            next_slot += period
+        else:
+            next_slot = t0 + period
     t_drive = t0
     t_dequeued = t0 + 0.0005  # the writer picks it up in ~0.4 ms
     # The screen is refreshed by update_gui() at its own rate; a string format
@@ -834,11 +896,26 @@ def stop_wheels():
         context.guiUpdater.setLastAction('stopped')
 
 
+def trainer_settings():
+    """The trainer address and rate cap: trainer.json if pushed, else the build."""
+    settings = dict(ip=BuildConfig.IP, port=BuildConfig.PORT, max_hz=MAX_HZ)
+    path = os.path.join(str(context.getExternalFilesDir(None)), 'trainer.json')
+    try:
+        with open(path) as f:
+            settings.update(json.load(f))
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print('dreamerBridge: ignoring %s: %s' % (path, e))
+    return settings
+
+
 def connect():
     """Try once to reach the trainer, without blocking the loop for long."""
-    global sock, last_attempt, next_tick, pipeline, last_act
+    global sock, last_attempt, next_tick, pipeline, last_act, max_hz
     last_attempt = time.monotonic()
-    address = (BuildConfig.IP, BuildConfig.PORT)
+    settings = trainer_settings()
+    address = (str(settings['ip']), int(settings['port']))
     try:
         candidate = socket.create_connection(address, timeout=CONNECT_TIMEOUT)
         # Reads block for much longer than the connect handshake may.
@@ -849,7 +926,7 @@ def connect():
         write(dict(type='hello', protocol=PROTOCOL, control_hz=CONTROL_HZ,
                    robot_id=ROBOT_ID, onboard=bool(runner and runner.ready),
                    policy_stamp=(runner.stamp if runner else None),
-                   pace=PACE))
+                   pace=PACE, max_hz=float(settings['max_hz'])))
         hello = read()
         if hello['type'] != 'hello' or hello['protocol'] != PROTOCOL:
             raise ValueError('Unexpected handshake %r' % hello)
@@ -859,6 +936,7 @@ def connect():
         # actions rather than send its own.
         global onboard, standalone, pace
         pace = hello.get('pace', PACE)
+        max_hz = float(hello.get('max_hz', settings['max_hz']))
         if pace not in ('serial', 'clock'):
             raise ValueError('Unknown pacing %r' % pace)
         onboard = bool(hello.get('onboard', False)) and runner.ready
@@ -869,9 +947,12 @@ def connect():
         last_act = time.monotonic()
         # cycle_ms is drive-to-drive; the first one of a session would
         # otherwise measure back to whatever the previous session did last.
-        global last_drive
+        global last_drive, next_slot
         last_drive = 0.0
+        next_slot = 0.0
         mode = ('pipelined' if pipeline else 'lock-step') + ', ' + pace + ' paced'
+        if pace == 'serial' and max_hz > 0:
+            mode += ' <= %g Hz' % max_hz
         print('dreamerBridge: connected to %s:%d (%s)' % (address + (mode,)))
         context.guiUpdater.setTrainerStatus(
             'connected to %s:%d (%s)' % (address + (mode,)))
