@@ -37,6 +37,15 @@ class SerialCommManager @JvmOverloads constructor(
     private val lifecycleLock = Any()
     private var runContext: RunContext? = null
 
+    /**
+     * How long to wait for the RP2040 to answer a command before giving up on
+     * it and sending the next one. The 10 s default suits the stock firmware,
+     * which can stall ~1 s after a coast. The fast firmware (RTT-LoopReduction)
+     * answers in ~8 ms, and there a single lost reply otherwise freezes the
+     * wheels for the full 10 s, so callers on it should set this much lower.
+     */
+    @Volatile var replyTimeoutMs: Int = 10000
+
     private var startTimeAndroid: Long = 0
     private var cnt: Int = 0
     private var durationAndroid: Long = 0
@@ -314,7 +323,7 @@ class SerialCommManager @JvmOverloads constructor(
     }
 
     private fun receivePacket() {
-        val receivedStatus = usbSerial.awaitPacketReceived(10000)
+        val receivedStatus = usbSerial.awaitPacketReceived(replyTimeoutMs)
         if (receivedStatus == 1) {
             //Note this is actually calling the functions like parseLog, parseStatus, etc.
             parseFifoPacket()
