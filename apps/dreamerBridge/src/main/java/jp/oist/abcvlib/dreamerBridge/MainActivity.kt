@@ -3,6 +3,9 @@ package jp.oist.abcvlib.dreamerBridge
 import android.content.Context
 import android.net.wifi.WifiManager
 import android.os.Bundle
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.lifecycleScope
 import com.chaquo.python.PyException
 import com.chaquo.python.Python
@@ -39,6 +42,14 @@ class MainActivity : AbcvlibActivity(), SerialReadyListener {
         Logger.setQuiet(true)
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        // Full screen: the display is read from a distance on a moving robot,
+        // so every pixel goes to the gauges. Swipe from an edge to see the bars.
+        supportActionBar?.hide()
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        WindowInsetsControllerCompat(window, binding.root).apply {
+            hide(WindowInsetsCompat.Type.systemBars())
+            systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        }
         guiUpdater = GuiUpdater(binding, this)
         // A robot run is unattended; letting the screen sleep would suspend the
         // control loop and the trainer would sit blocked waiting for us.

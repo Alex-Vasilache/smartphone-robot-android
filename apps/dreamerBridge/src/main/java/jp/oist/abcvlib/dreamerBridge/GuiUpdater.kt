@@ -65,142 +65,170 @@ class GuiUpdater(
     /** Free-text note on the wheels, e.g. "stopped". */
     @Volatile var lastAction: String = ""
 
-    private inner class Row(
-        label: String, unit: String, private val read: () -> Double,
-        private val format: String, private val bar: BarView?,
-    ) {
-        private val text: TextView
-        private val range: TextView?
-
-        init {
-            val line = LinearLayout(activity).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-                setPadding(0, dp(5), 0, dp(5))
-            }
-            line.addView(mono(label, LABEL).apply { maxLines = 1 },
-                LinearLayout.LayoutParams(dp(72), LinearLayout.LayoutParams.WRAP_CONTENT))
-            text = mono("", VALUE).apply { gravity = Gravity.END }
-            line.addView(text,
-                LinearLayout.LayoutParams(dp(78), LinearLayout.LayoutParams.WRAP_CONTENT))
-            line.addView(mono(" $unit", UNIT).apply { textSize = 11f },
-                LinearLayout.LayoutParams(dp(40), LinearLayout.LayoutParams.WRAP_CONTENT))
-            if (bar != null) {
-                line.addView(bar, LinearLayout.LayoutParams(0, dp(12), 1f).apply {
-                    marginStart = dp(4)
-                })
-                range = mono("", UNIT).apply { textSize = 10f; setPadding(dp(6), 0, 0, 0) }
-                line.addView(range,
-                    LinearLayout.LayoutParams(dp(44), LinearLayout.LayoutParams.WRAP_CONTENT))
-            } else {
-                range = null
-            }
-            binding.rows.addView(line)
-        }
-
-        fun update() {
-            val v = read()
-            text.text = String.format(Locale.US, format, v)
-            bar?.value = v
-            if (bar != null) range?.text = bar.rangeLabel()
-        }
-    }
-
-    private val rows = mutableListOf<Row>()
-
     private fun dp(v: Int) = (v * activity.resources.displayMetrics.density).toInt()
 
-    private fun mono(s: String, color: Int) = TextView(activity).apply {
-        text = s
-        typeface = Typeface.MONOSPACE
-        textSize = 15f
-        setTextColor(color)
+    private fun text(s: String, color: Int, size: Float, bold: Boolean = false) =
+        TextView(activity).apply {
+            text = s
+            typeface = Typeface.create(Typeface.MONOSPACE, if (bold) Typeface.BOLD else Typeface.NORMAL)
+            textSize = size
+            maxLines = 1
+            setTextColor(color)
+        }
+
+    private fun spacer() {
+        binding.rows.addView(android.view.View(activity),
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
     }
 
     private fun section(title: String) {
-        binding.rows.addView(mono(title, ACCENT).apply {
-            setTypeface(Typeface.MONOSPACE, Typeface.BOLD)
-            textSize = 13f
-            letterSpacing = 0.1f
-            setPadding(0, dp(14), 0, dp(4))
+        spacer()
+        binding.rows.addView(text(title, Palette.INK_3, 11f, bold = true).apply {
+            letterSpacing = 0.12f
+            setPadding(0, dp(4), 0, dp(6))
         })
     }
 
-    private fun signed(label: String, unit: String, range: Double, decimals: Int = 2,
-                       auto: Boolean = false, read: () -> Double) {
-        rows += Row(label, unit, read, "%+8.${decimals}f",
-            BarView(activity, -range, range, signed = true, autoRange = auto))
+    private fun hstack() = LinearLayout(activity).apply {
+        orientation = LinearLayout.HORIZONTAL
+        gravity = Gravity.CENTER_VERTICAL
     }
 
-    private fun unsigned(label: String, unit: String, lo: Double, hi: Double,
-                         decimals: Int = 2, read: () -> Double) {
-        rows += Row(label, unit, read, "%8.${decimals}f",
-            BarView(activity, lo, hi, signed = false))
+    private fun vstack() = LinearLayout(activity).apply { orientation = LinearLayout.VERTICAL }
+
+    private fun weight(w: Float = 1f) =
+        LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, w)
+
+    private val updates = mutableListOf<() -> Unit>()
+
+    /** Tier 2: a large signed gauge -- label and big value above a thick bar. */
+    private fun gauge(label: String, unit: String, range: Double, format: String,
+                      read: () -> Double) {
+        val head = hstack()
+        head.addView(text(label, Palette.INK_2, 14f), weight())
+        val value = text("", Palette.INK, 26f, bold = true)
+        head.addView(value)
+        head.addView(text(" $unit", Palette.INK_3, 12f))
+        binding.rows.addView(head)
+        val bar = BarView(activity, -range, range, signed = true)
+        binding.rows.addView(bar, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, dp(22)).apply { topMargin = dp(2) })
+        val ends = hstack()
+        ends.addView(text(String.format(Locale.US, "%+.0f", -range), Palette.INK_3, 10f), weight())
+        ends.addView(text(String.format(Locale.US, "%+.0f", range), Palette.INK_3, 10f))
+        binding.rows.addView(ends, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+            bottomMargin = dp(6)
+        })
+        updates += {
+            val v = read()
+            value.text = String.format(Locale.US, format, v)
+            bar.value = v
+        }
     }
 
-    private fun count(label: String, read: () -> Double) {
-        rows += Row(label, "", read, "%8.0f", null)
+    /** Tier 2, drawn differently on purpose: one wheel as two vertical columns,
+     *  the command (thick) and the measured speed (thin, auto-ranged); up is forward. */
+    private fun wheel(name: String, cmd: () -> Double, speed: () -> Double): LinearLayout {
+        val col = vstack().apply { gravity = Gravity.CENTER_HORIZONTAL }
+        col.addView(text(name, Palette.INK_2, 14f).apply { gravity = Gravity.CENTER })
+        val bars = hstack().apply { gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL }
+        val c = BarView(activity, -1.0, 1.0, signed = true, vertical = true)
+        val sp = BarView(activity, -1.0, 1.0, signed = true, autoRange = true, vertical = true)
+        bars.addView(c, LinearLayout.LayoutParams(dp(48), dp(104)))
+        bars.addView(sp, LinearLayout.LayoutParams(dp(10), dp(104)).apply { marginStart = dp(6) })
+        col.addView(bars, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+            topMargin = dp(4); bottomMargin = dp(4)
+        })
+        val cv = text("", Palette.INK, 22f, bold = true).apply { gravity = Gravity.CENTER }
+        col.addView(cv)
+        val sv = text("", Palette.INK_3, 11f).apply { gravity = Gravity.CENTER }
+        col.addView(sv)
+        updates += {
+            c.value = cmd(); sp.value = speed()
+            cv.text = String.format(Locale.US, "%+.2f", c.value)
+            sv.text = String.format(Locale.US, "speed %+.0f", sp.value)
+        }
+        return col
     }
 
-    private val rewardBar = BarView(activity, -1.0, 1.0, signed = true)
+    /** Tier 3: a small stat tile -- label, value, and an optional thin meter. */
+    private fun tile(row: LinearLayout, label: String, meter: BarView?, read: () -> Pair<String, Double>) {
+        val t = vstack().apply { setPadding(dp(6), 0, dp(6), 0) }
+        t.addView(text(label, Palette.INK_3, 11f).apply { gravity = Gravity.CENTER })
+        val v = text("", Palette.INK_2, 15f).apply { gravity = Gravity.CENTER }
+        t.addView(v)
+        if (meter != null) {
+            t.addView(meter, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(4)).apply { topMargin = dp(3) })
+        }
+        row.addView(t, weight())
+        updates += {
+            val (s, x) = read()
+            v.text = s
+            meter?.value = x
+        }
+    }
+
+    // Per step the reward is at most 1.0 (upright and still) and in practice
+    // no lower than about -0.6 (at a bumper, wobbling, wheels at full speed).
+    private val rewardBar = BarView(activity, -0.5, 1.0, signed = true)
 
     init {
         binding.rewardBar.addView(rewardBar,
-            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(18)))
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(64)))
+
         section("BODY")
-        signed("tilt", "deg", 45.0) { thetaDeg }
-        signed("rate", "deg/s", 250.0, 1) { angularVelocityDeg }
-        section("WHEELS")
-        signed("cmd L", "", 1.0) { actionL }
-        signed("cmd R", "", 1.0) { actionR }
-        signed("speed L", "", 1.0, auto = true) { wheelSpeedL }
-        signed("speed R", "", 1.0, auto = true) { wheelSpeedR }
-        count("count L") { wheelCountL.toDouble() }
-        count("count R") { wheelCountR.toDouble() }
-        section("CONTROL")
-        unsigned("loop", "Hz", 0.0, 50.0, 1) { controlHz }
-        count("step") { step.toDouble() }
-        section("POWER")
-        unsigned("battery", "V", 3.0, 4.3) { batteryVoltage }
-        unsigned("charger", "V", 0.0, 6.0) { chargerVoltage }
-        unsigned("coil", "V", 0.0, 6.0) { coilVoltage }
+        gauge("tilt", "deg", 30.0, "%+7.2f") { thetaDeg }
+        gauge("tilt rate", "deg/s", 200.0, "%+7.1f") { angularVelocityDeg }
+
+        section("WHEELS  (command · speed)")
+        val wheels = hstack().apply { gravity = Gravity.CENTER }
+        wheels.addView(wheel("left", { actionL }, { wheelSpeedL }), weight())
+        wheels.addView(wheel("right", { actionR }, { wheelSpeedR }), weight())
+        binding.rows.addView(wheels)
+
+        section("SYSTEM")
+        val r1 = hstack()
+        tile(r1, "loop", BarView(activity, 0.0, 50.0, signed = false)) {
+            Pair(String.format(Locale.US, "%.1f Hz", controlHz), controlHz)
+        }
+        tile(r1, "battery", BarView(activity, 3.0, 4.3, signed = false)) {
+            Pair(String.format(Locale.US, "%.2f V", batteryVoltage), batteryVoltage)
+        }
+        tile(r1, "step", null) { Pair(String.format(Locale.US, "%d", step), 0.0) }
+        binding.rows.addView(r1)
+        val r2 = hstack().apply { setPadding(0, dp(8), 0, 0) }
+        tile(r2, "count L / R", null) {
+            Pair(String.format(Locale.US, "%d / %d", wheelCountL, wheelCountR), 0.0)
+        }
+        tile(r2, "charger · coil", null) {
+            Pair(String.format(Locale.US, "%.2f · %.2f V", chargerVoltage, coilVoltage), 0.0)
+        }
+        binding.rows.addView(r2)
+        spacer()
     }
 
     fun displayValues() {
         activity.runOnUiThread {
-            binding.rewardBig.text = String.format(Locale.US, "%+.3f", rewardAvg)
-            val rewardColor = when {
-                rewardAvg >= 0.7 -> GOOD
-                rewardAvg >= 0.3 -> WARN
-                else -> BAD
+            val color = when {
+                rewardAvg >= 0.7 -> Palette.GOOD
+                rewardAvg >= 0.3 -> Palette.FAIR
+                else -> Palette.POOR
             }
-            binding.rewardBig.setTextColor(rewardColor)
-            rewardBar.fillColor = rewardColor
+            rewardBar.positive = color
+            rewardBar.negative = color
             rewardBar.value = rewardAvg
+            rewardBar.label = String.format(Locale.US, "%+.2f", rewardAvg)
             binding.rewardEpisode.text = String.format(Locale.US,
-                "episode  %+.3f/step  %+8.1f\nlast     %s",
-                episodeMean, episodeReturn,
-                if (lastEpisodeMean.isNaN()) "-"
-                else String.format(Locale.US, "%+.3f/step  %+8.1f", lastEpisodeMean, lastEpisodeReturn))
-            rows.forEach { it.update() }
-            binding.status.text = String.format(Locale.US, "trainer  %s%s%s", trainerStatus,
-                if (serialNote.isNotEmpty()) "\nserial   $serialNote" else "",
-                if (lastAction.isNotEmpty()) "\nwheels   $lastAction" else "")
-            binding.status.setTextColor(when {
-                trainerStatus.startsWith("connected") || trainerStatus.startsWith("policy") -> GOOD
-                trainerStatus.startsWith("standalone") -> ACCENT
-                else -> WARN
-            })
+                "this episode %+.2f/step     last %s",
+                episodeMean,
+                if (lastEpisodeMean.isNaN()) "  -" else String.format(Locale.US, "%+.2f/step", lastEpisodeMean))
+            updates.forEach { it() }
+            // Always the same lines, so a longer status never moves the layout.
+            binding.status.text = String.format(Locale.US, "trainer %s\nserial  %s",
+                trainerStatus.substringBefore(" ("), serialNote.ifEmpty { "ok" })
         }
-    }
-
-    private companion object {
-        const val ACCENT = 0xFF4FC3F7.toInt()
-        const val LABEL = 0xFFB0B0B0.toInt()
-        const val VALUE = 0xFFFFFFFF.toInt()
-        const val UNIT = 0xFF808080.toInt()
-        const val GOOD = 0xFF81C784.toInt()
-        const val WARN = 0xFFFFB74D.toInt()
-        const val BAD = 0xFFEF5350.toInt()
     }
 }
