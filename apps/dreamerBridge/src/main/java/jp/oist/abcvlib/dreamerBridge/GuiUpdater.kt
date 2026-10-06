@@ -28,11 +28,19 @@ class GuiUpdater(
     @Volatile var thetaDeg: Double = 0.0
     @Volatile var angularVelocityDeg: Double = 0.0
 
-    /** Raw gyroscope pitch rate (device x axis), deg/s. No fusion filter. */
-    @Volatile var gyroDeg: Double = 0.0
-
     /** Reward the trainer scored for the state we last reported. */
     @Volatile var reward: Double = 0.0
+
+    /** The same, averaged over ~0.5 s of steps: the headline number. */
+    @Volatile var rewardAvg: Double = 0.0
+
+    /** Mean reward per step so far this episode, and the return so far. */
+    @Volatile var episodeMean: Double = 0.0
+    @Volatile var episodeReturn: Double = 0.0
+
+    /** The same for the last finished episode. */
+    @Volatile var lastEpisodeMean: Double = Double.NaN
+    @Volatile var lastEpisodeReturn: Double = Double.NaN
     @Volatile var wheelSpeedL: Double = 0.0
     @Volatile var wheelSpeedR: Double = 0.0
     @Volatile var wheelCountL: Long = 0
@@ -50,6 +58,9 @@ class GuiUpdater(
 
     /** Connection state of the trainer socket. */
     @Volatile var trainerStatus: String = "starting"
+
+    /** Missed RP2040 replies, e.g. "3 missed replies, last 15:35:04". */
+    @Volatile var serialNote: String = ""
 
     /** Free-text note on the wheels, e.g. "stopped". */
     @Volatile var lastAction: String = ""
@@ -75,7 +86,9 @@ class GuiUpdater(
             line.addView(mono(" $unit", UNIT).apply { textSize = 11f },
                 LinearLayout.LayoutParams(dp(40), LinearLayout.LayoutParams.WRAP_CONTENT))
             if (bar != null) {
-                line.addView(bar, LinearLayout.LayoutParams(0, dp(12), 1f))
+                line.addView(bar, LinearLayout.LayoutParams(0, dp(12), 1f).apply {
+                    marginStart = dp(4)
+                })
                 range = mono("", UNIT).apply { textSize = 10f; setPadding(dp(6), 0, 0, 0) }
                 line.addView(range,
                     LinearLayout.LayoutParams(dp(44), LinearLayout.LayoutParams.WRAP_CONTENT))
@@ -129,11 +142,14 @@ class GuiUpdater(
         rows += Row(label, "", read, "%8.0f", null)
     }
 
+    private val rewardBar = BarView(activity, -1.0, 1.0, signed = true)
+
     init {
+        binding.rewardBar.addView(rewardBar,
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(18)))
         section("BODY")
         signed("tilt", "deg", 45.0) { thetaDeg }
         signed("rate", "deg/s", 250.0, 1) { angularVelocityDeg }
-        signed("gyro", "deg/s", 250.0, 1) { gyroDeg }
         section("WHEELS")
         signed("cmd L", "", 1.0) { actionL }
         signed("cmd R", "", 1.0) { actionR }
@@ -143,7 +159,6 @@ class GuiUpdater(
         count("count R") { wheelCountR.toDouble() }
         section("CONTROL")
         unsigned("loop", "Hz", 0.0, 50.0, 1) { controlHz }
-        signed("reward", "", 1.0, 3) { reward }
         count("step") { step.toDouble() }
         section("POWER")
         unsigned("battery", "V", 3.0, 4.3) { batteryVoltage }
@@ -153,8 +168,23 @@ class GuiUpdater(
 
     fun displayValues() {
         activity.runOnUiThread {
+            binding.rewardBig.text = String.format(Locale.US, "%+.3f", rewardAvg)
+            val rewardColor = when {
+                rewardAvg >= 0.7 -> GOOD
+                rewardAvg >= 0.3 -> WARN
+                else -> BAD
+            }
+            binding.rewardBig.setTextColor(rewardColor)
+            rewardBar.fillColor = rewardColor
+            rewardBar.value = rewardAvg
+            binding.rewardEpisode.text = String.format(Locale.US,
+                "episode  %+.3f/step  %+8.1f\nlast     %s",
+                episodeMean, episodeReturn,
+                if (lastEpisodeMean.isNaN()) "-"
+                else String.format(Locale.US, "%+.3f/step  %+8.1f", lastEpisodeMean, lastEpisodeReturn))
             rows.forEach { it.update() }
-            binding.status.text = String.format(Locale.US, "trainer  %s%s", trainerStatus,
+            binding.status.text = String.format(Locale.US, "trainer  %s%s%s", trainerStatus,
+                if (serialNote.isNotEmpty()) "\nserial   $serialNote" else "",
                 if (lastAction.isNotEmpty()) "\nwheels   $lastAction" else "")
             binding.status.setTextColor(when {
                 trainerStatus.startsWith("connected") || trainerStatus.startsWith("policy") -> GOOD
@@ -171,5 +201,6 @@ class GuiUpdater(
         const val UNIT = 0xFF808080.toInt()
         const val GOOD = 0xFF81C784.toInt()
         const val WARN = 0xFFFFB74D.toInt()
+        const val BAD = 0xFFEF5350.toInt()
     }
 }

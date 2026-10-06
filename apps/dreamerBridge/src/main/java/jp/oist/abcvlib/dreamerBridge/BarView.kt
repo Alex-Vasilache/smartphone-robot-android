@@ -42,6 +42,10 @@ class BarView(
         if (v == Math.rint(v) || abs(v) >= 10) String.format(java.util.Locale.US, "%.0f", v)
         else String.format(java.util.Locale.US, "%.1f", v)
 
+    /** Override the fill colour (e.g. to match a value's own colour). */
+    var fillColor: Int? = null
+        set(c) { field = c; invalidate() }
+
     private val minAutoSpan = if (autoRange) max(abs(hi), abs(lo)) else 0.0
 
     private val track = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFF2C2C2C.toInt() }
@@ -64,7 +68,9 @@ class BarView(
         if (!value.isFinite()) return
         val base = if (signed) x(0.0) else 0f
         val end = x(value)
+        val override = fillColor
         val paint = when {
+            override != null -> positive.also { it.color = override }
             value > hi || value < lo -> clipped
             signed && value < 0 -> negative
             else -> positive

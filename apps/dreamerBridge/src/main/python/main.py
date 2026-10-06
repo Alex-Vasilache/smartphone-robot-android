@@ -75,6 +75,8 @@ ACTION_TIMEOUT = 1.0
 # How often the idle loop refreshes the display while waiting for a trainer.
 IDLE_PERIOD = 0.05
 ROBOT_ID = 1
+# Display smoothing of the per-step reward: ~0.5 s of steps at 25 Hz.
+REWARD_AVG_ALPHA = 0.08
 # Serial pacing runs as fast as the RP2040 answers. On the stock firmware that
 # is ~11 Hz; on the fast firmware (RTT-LoopReduction) it can exceed 50 Hz,
 # which shortens the return horizon in seconds and, in the real-time cartpole
@@ -223,6 +225,9 @@ control_hz = 0.0
 drive_ms = 0.0    # cost of handing one action to the serial writer
 pace = PACE        # negotiated per connection
 max_hz = MAX_HZ    # negotiated per connection
+reward_avg = 0.0   # display only, see note_reward
+ep_return = 0.0
+ep_steps = 0
 next_slot = 0.0    # monotonic time of the next decision when max_hz caps it
 last_drive = 0.0   # monotonic time of the previous drive(), for cycle_ms
 seq = 0            # observation sequence, echoed by the trainer in its action
@@ -243,6 +248,7 @@ warm_ms = WARM_MS
 warm_n = 1
 prepare_ahead = PREPARE_AHEAD
 serial_ok = True          # the RP2040 answered within SERIAL_WAIT_MAX_MS
+serial_misses = 0         # waits that hit SERIAL_WAIT_MAX_MS, for the display
 last_serial_warning = 0.0
 last_stale_warning = 0.0
 
@@ -440,10 +446,11 @@ def loop():
             # The trainer scores the observation we just sent, so the reward
             # that comes back with the next action is this state's.
             apply_overrides(act)
-            context.guiUpdater.setReward(float(act.get('reward', 0.0)))
+            note_reward(float(act.get('reward', 0.0)))
             if act['reset']:
                 stop_wheels()
                 step = 0
+                end_episode()
             else:
                 drive(act['left'], act['right'])
             last_act = time.monotonic()
@@ -473,6 +480,32 @@ def loop():
         update_gui()
 
 
+def note_reward(reward):
+    """Track the reward the trainer scored for each step, for the display.
+
+    One step's reward jumps around at 25 Hz and the screen refreshes at 10, so
+    the headline number is an exponential average over ~0.5 s of steps.
+    """
+    global reward_avg, ep_return, ep_steps
+    reward_avg += REWARD_AVG_ALPHA * (reward - reward_avg)
+    ep_return += reward
+    ep_steps += 1
+    gui = context.guiUpdater
+    gui.setReward(reward)
+    gui.setRewardAvg(reward_avg)
+    gui.setEpisodeMean(ep_return / ep_steps)
+    gui.setEpisodeReturn(ep_return)
+
+
+def end_episode():
+    global ep_return, ep_steps
+    if ep_steps:
+        context.guiUpdater.setLastEpisodeReturn(ep_return)
+        context.guiUpdater.setLastEpisodeMean(ep_return / ep_steps)
+    ep_return = 0.0
+    ep_steps = 0
+
+
 def update_gui():
     """Mirror the current step onto the phone screen, at a human rate."""
     global last_report, last_gui, control_hz
@@ -497,7 +530,6 @@ def update_gui():
     gui.setCoilVoltage(sensors['coil_voltage'])
     gui.setThetaDeg(math.degrees(sensors['theta']))
     gui.setAngularVelocityDeg(math.degrees(sensors['angular_velocity']))
-    gui.setGyroDeg(math.degrees(SensorLatencyTrace.INSTANCE.getGyroX()))
     gui.setWheelSpeedL(float(sensors['wheel_speed_l']))
     gui.setWheelSpeedR(float(sensors['wheel_speed_r']))
     gui.setWheelCountL(int(sensors['wheel_count_l']))
@@ -645,11 +677,12 @@ def loop_trainer_serial():
 
     if act is not None:
         apply_overrides(act)
-        context.guiUpdater.setReward(float(act.get('reward', 0.0)))
+        note_reward(float(act.get('reward', 0.0)))
         last_act = got
         if act['reset']:
             stop_wheels()
             step = 0
+            end_episode()
         else:
             drive(act['left'], act['right'])
     elif time.monotonic() - last_act > ACTION_TIMEOUT:
@@ -691,8 +724,9 @@ def drain_control():
                 context.guiUpdater.setTrainerStatus('policy %s' % stamp)
         elif kind in ('act', 'ctrl'):
             apply_overrides(header)
-            context.guiUpdater.setReward(float(header.get('reward', 0.0)))
+            note_reward(float(header.get('reward', 0.0)))
             if header.get('reset'):
+                end_episode()
                 # The trainer owns episode boundaries; it is the side that
                 # knows the length and the termination rule. Only the timing
                 # is relaxed -- a reset one tick late costs nothing, unlike an
@@ -718,7 +752,7 @@ def wait_for_serial(lead_ms=0.0):
     """Block until the RP2040 has answered the previous command, then until it
     is about to poll USB again, then, under a max_hz cap, until `lead_ms`
     before the next decision slot. Returns how long that took, in ms."""
-    global serial_ok, last_serial_warning
+    global serial_ok, last_serial_warning, serial_misses
     t0 = time.monotonic()
     deadline = t0 + SERIAL_WAIT_MAX_MS / 1e3
     warmed = False
@@ -736,11 +770,13 @@ def wait_for_serial(lead_ms=0.0):
             continue
         if time.monotonic() >= deadline:
             serial_ok = False
+            serial_misses += 1
+            context.guiUpdater.setSerialNote('%d missed replies, last %s' % (
+                serial_misses, time.strftime('%H:%M:%S')))
             if time.monotonic() - last_serial_warning > 5.0:
                 last_serial_warning = time.monotonic()
                 print('dreamerBridge: no reply from the RP2040 for %.0f ms; '
                       'carrying on without it' % SERIAL_WAIT_MAX_MS)
-                context.guiUpdater.setTrainerStatus('SERIAL LINK DOWN')
             return (time.monotonic() - t0) * 1e3
         near = spin_before_ms and t_dequeued and \
             time.monotonic() - t_dequeued >= (REPLY_MS - spin_before_ms) / 1e3
