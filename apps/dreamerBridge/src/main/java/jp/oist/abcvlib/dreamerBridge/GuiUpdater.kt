@@ -246,7 +246,7 @@ class GuiUpdater(
             // Always the same lines, so a longer status never moves the layout.
             val trainer = trainerStatus.substringBefore(" (")
                 .replace("connected to ", "trainer ").replace("policy ", "policy …")
-            binding.status.text = String.format(Locale.US, "%s\n%s", trainer.take(28),
+            binding.status.text = String.format(Locale.US, "%s\n%s", trainer.take(34),
                 if (serialNote.isEmpty()) "serial ok" else "serial " + serialNote
                     .replace(" missed replies, last ", " missed, last "))
         }
