@@ -159,6 +159,16 @@ class GuiUpdater(
         return col
     }
 
+    /** A wheel's encoder count, set beside its column on the outer side. */
+    private fun count(read: () -> Long): LinearLayout {
+        val box = vstack().apply { gravity = Gravity.CENTER }
+        box.addView(text("count", Palette.INK_3, 10f).apply { gravity = Gravity.CENTER })
+        val v = text("", Palette.INK_2, 14f).apply { gravity = Gravity.CENTER }
+        box.addView(v)
+        updates += { v.text = String.format(Locale.US, "%d", read()) }
+        return box
+    }
+
     /** Tier 3: a small stat tile -- label, value, and an optional thin meter. */
     private fun tile(row: LinearLayout, label: String, meter: BarView?, read: () -> Pair<String, Double>) {
         val t = vstack().apply { setPadding(dp(6), 0, dp(6), 0) }
@@ -187,34 +197,38 @@ class GuiUpdater(
         spacer()
         // The robot's working tilt is about -7 to +9 deg (its bumpers); the
         // scale shows a little more and widens for anything beyond.
-        gauge("tilt", "deg", -10.0, 12.0, "%+7.2f") { thetaDeg }
-        gauge("tilt rate", "deg/s", -200.0, 200.0, "%+7.1f") { angularVelocityDeg }
+        gauge("angle", "deg", -10.0, 12.0, "%+7.2f") { thetaDeg }
+        gauge("angular velocity", "deg/s", -200.0, 200.0, "%+7.1f") { angularVelocityDeg }
 
         spacer()
         // Below ~40% of the screen height the robot's cradle covers the sides,
         // narrowing towards the bottom, so everything from here down is inset.
-        val wheels = hstack().apply { gravity = Gravity.CENTER; setPadding(dp(48), 0, dp(48), 0) }
-        val full = { LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f) }
-        wheels.addView(wheel("left", { actionL }, { wheelSpeedL }), full())
-        wheels.addView(wheel("right", { actionR }, { wheelSpeedR }), full())
+        val wheels = hstack().apply { gravity = Gravity.CENTER }
+        // count | left column | gap | right column | count, centred as one unit.
+        val col = { LinearLayout.LayoutParams(dp(110), LinearLayout.LayoutParams.MATCH_PARENT) }
+        val side = { LinearLayout.LayoutParams(dp(64), LinearLayout.LayoutParams.WRAP_CONTENT) }
+        wheels.addView(count { wheelCountL }, side())
+        wheels.addView(wheel("left", { actionL }, { wheelSpeedL }), col())
+        wheels.addView(android.view.View(activity), LinearLayout.LayoutParams(dp(16), 1))
+        wheels.addView(wheel("right", { actionR }, { wheelSpeedR }), col())
+        wheels.addView(count { wheelCountR }, side())
         binding.rows.addView(wheels, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
 
         spacer(); spacer()
-        val r1 = hstack().apply { setPadding(dp(40), 0, dp(40), 0) }
-        tile(r1, "loop", BarView(activity, 0.0, 50.0, signed = false)) {
+        // Two groups, one row each: how the control loop is running, and power.
+        val control = hstack().apply { setPadding(dp(64), 0, dp(64), 0) }
+        tile(control, "loop", BarView(activity, 0.0, 50.0, signed = false)) {
             Pair(String.format(Locale.US, "%.1f Hz", controlHz), controlHz)
         }
-        tile(r1, "battery", BarView(activity, 3.0, 4.3, signed = false)) {
+        tile(control, "step", null) { Pair(String.format(Locale.US, "%d", step), 0.0) }
+        binding.rows.addView(control)
+        val power = hstack().apply { setPadding(dp(32), dp(10), dp(32), dp(12)) }
+        tile(power, "battery", BarView(activity, 3.0, 4.3, signed = false)) {
             Pair(String.format(Locale.US, "%.2f V", batteryVoltage), batteryVoltage)
         }
-        tile(r1, "step", null) { Pair(String.format(Locale.US, "%d", step), 0.0) }
-        binding.rows.addView(r1)
-        val r2 = hstack().apply { setPadding(dp(24), dp(8), dp(24), 0) }
-        tile(r2, "count L", null) { Pair(String.format(Locale.US, "%d", wheelCountL), 0.0) }
-        tile(r2, "count R", null) { Pair(String.format(Locale.US, "%d", wheelCountR), 0.0) }
-        tile(r2, "charger", null) { Pair(String.format(Locale.US, "%.2f V", chargerVoltage), 0.0) }
-        tile(r2, "coil", null) { Pair(String.format(Locale.US, "%.2f V", coilVoltage), 0.0) }
-        binding.rows.addView(r2)
+        tile(power, "charger", null) { Pair(String.format(Locale.US, "%.2f V", chargerVoltage), 0.0) }
+        tile(power, "coil", null) { Pair(String.format(Locale.US, "%.2f V", coilVoltage), 0.0) }
+        binding.rows.addView(power)
     }
 
     fun displayValues() {
