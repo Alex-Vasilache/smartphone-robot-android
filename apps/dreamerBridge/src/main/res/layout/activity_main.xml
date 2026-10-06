@@ -49,10 +49,16 @@
         android:layout_weight="1"
         android:orientation="vertical" />
 
+    <!-- Centred and narrow: at the bottom only the middle of the screen is
+         visible past the cradle. The bottom strip below it stays empty. -->
     <TextView
         android:id="@+id/status"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
+        android:layout_marginStart="72dp"
+        android:layout_marginEnd="72dp"
+        android:layout_marginBottom="72dp"
+        android:gravity="center"
         android:fontFamily="monospace"
         android:lines="2"
         android:ellipsize="end"

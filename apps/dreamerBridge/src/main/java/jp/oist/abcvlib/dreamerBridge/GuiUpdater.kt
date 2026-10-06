@@ -81,11 +81,11 @@ class GuiUpdater(
             LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
     }
 
-    private fun section(title: String) {
+    private fun section(title: String, inset: Int = 0) {
         spacer()
         binding.rows.addView(text(title, Palette.INK_3, 11f, bold = true).apply {
             letterSpacing = 0.12f
-            setPadding(0, dp(4), 0, dp(6))
+            setPadding(dp(inset), dp(4), 0, dp(6))
         })
     }
 
@@ -183,14 +183,16 @@ class GuiUpdater(
         gauge("tilt", "deg", 30.0, "%+7.2f") { thetaDeg }
         gauge("tilt rate", "deg/s", 200.0, "%+7.1f") { angularVelocityDeg }
 
-        section("WHEELS  (command · speed)")
-        val wheels = hstack().apply { gravity = Gravity.CENTER }
+        section("WHEELS  (command · speed)", inset = 40)
+        // Below ~40% of the screen height the robot's cradle covers the sides,
+        // narrowing towards the bottom, so everything from here down is inset.
+        val wheels = hstack().apply { gravity = Gravity.CENTER; setPadding(dp(48), 0, dp(48), 0) }
         wheels.addView(wheel("left", { actionL }, { wheelSpeedL }), weight())
         wheels.addView(wheel("right", { actionR }, { wheelSpeedR }), weight())
         binding.rows.addView(wheels)
 
-        section("SYSTEM")
-        val r1 = hstack()
+        section("SYSTEM", inset = 40)
+        val r1 = hstack().apply { setPadding(dp(40), 0, dp(40), 0) }
         tile(r1, "loop", BarView(activity, 0.0, 50.0, signed = false)) {
             Pair(String.format(Locale.US, "%.1f Hz", controlHz), controlHz)
         }
@@ -199,7 +201,7 @@ class GuiUpdater(
         }
         tile(r1, "step", null) { Pair(String.format(Locale.US, "%d", step), 0.0) }
         binding.rows.addView(r1)
-        val r2 = hstack().apply { setPadding(0, dp(8), 0, 0) }
+        val r2 = hstack().apply { setPadding(dp(56), dp(8), dp(56), 0) }
         tile(r2, "count L / R", null) {
             Pair(String.format(Locale.US, "%d / %d", wheelCountL, wheelCountR), 0.0)
         }
@@ -227,8 +229,11 @@ class GuiUpdater(
                 if (lastEpisodeMean.isNaN()) "  -" else String.format(Locale.US, "%+.2f/step", lastEpisodeMean))
             updates.forEach { it() }
             // Always the same lines, so a longer status never moves the layout.
-            binding.status.text = String.format(Locale.US, "trainer %s\nserial  %s",
-                trainerStatus.substringBefore(" ("), serialNote.ifEmpty { "ok" })
+            val trainer = trainerStatus.substringBefore(" (")
+                .replace("connected to ", "trainer ").replace("policy ", "policy …")
+            binding.status.text = String.format(Locale.US, "%s\n%s", trainer.take(28),
+                if (serialNote.isEmpty()) "serial ok" else "serial " + serialNote
+                    .replace(" missed replies, last ", " missed, last "))
         }
     }
 }
