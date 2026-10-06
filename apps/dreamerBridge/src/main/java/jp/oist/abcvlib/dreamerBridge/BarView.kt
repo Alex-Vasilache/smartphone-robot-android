@@ -59,6 +59,16 @@ class BarView(
     var negative: Int = Palette.RED
     var track: Int = Palette.TRACK
 
+    /**
+     * A second quantity drawn as a narrow translucent strip down the middle of
+     * the bar, from the same zero, as a fraction of its own range in [-1, 1].
+     * The wheels use it for measured speed inside the command column.
+     */
+    var secondary: Double? = null
+        set(v) { field = v; invalidate() }
+
+    private val overlay = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0x99FFFFFF.toInt() }
+
     /** Text drawn centred on the bar, e.g. its own value. */
     var label: String? = null
         set(t) { field = t; invalidate() }
@@ -112,6 +122,20 @@ class BarView(
             if (signed) {
                 if (vertical) canvas.drawLine(0f, h - a, w, h - a, zero)
                 else canvas.drawLine(a, 0f, a, h, zero)
+            }
+            secondary?.let { f ->
+                if (f.isFinite()) {
+                    val z = pos(0.0)
+                    val e = pos(lo + (f.coerceIn(-1.0, 1.0) + 1.0) / 2.0 * (hi - lo))
+                    if (vertical) {
+                        val half = w * 0.12f
+                        rect.set(w / 2f - half, h - max(z, e), w / 2f + half, h - minOf(z, e))
+                    } else {
+                        val half = h * 0.12f
+                        rect.set(minOf(z, e), h / 2f - half, max(z, e), h / 2f + half)
+                    }
+                    canvas.drawRect(rect, overlay)
+                }
             }
         }
         label?.let {

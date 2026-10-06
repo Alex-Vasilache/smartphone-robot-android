@@ -137,22 +137,24 @@ class GuiUpdater(
         val col = vstack().apply { gravity = Gravity.CENTER_HORIZONTAL }
         // The wheels take whatever height is left, so the screen is always full.
         col.addView(text(name, Palette.INK_2, 14f).apply { gravity = Gravity.CENTER })
-        val bars = hstack().apply { gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL }
+        // Command as the column's fill; measured speed as a narrow strip down
+        // its middle, scaled to the largest speed seen (decaying), so the
+        // column stays symmetric under its centred label and numbers.
         val c = BarView(activity, -1.0, 1.0, signed = true, vertical = true)
-        val sp = BarView(activity, -1.0, 1.0, signed = true, autoRange = true, vertical = true)
-        bars.addView(c, LinearLayout.LayoutParams(dp(56), LinearLayout.LayoutParams.MATCH_PARENT))
-        bars.addView(sp, LinearLayout.LayoutParams(dp(12), LinearLayout.LayoutParams.MATCH_PARENT)
-            .apply { marginStart = dp(6) })
-        col.addView(bars, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, 0, 1f)
+        var speedSpan = 1.0
+        col.addView(c, LinearLayout.LayoutParams(dp(64), 0, 1f)
             .apply { topMargin = dp(6); bottomMargin = dp(6) })
         val cv = text("", Palette.INK, 22f, bold = true).apply { gravity = Gravity.CENTER }
         col.addView(cv)
         val sv = text("", Palette.INK_3, 11f).apply { gravity = Gravity.CENTER }
         col.addView(sv)
         updates += {
-            c.value = cmd(); sp.value = speed()
+            val s = speed()
+            speedSpan = maxOf(speedSpan * 0.995, kotlin.math.abs(s) * 1.1, 1.0)
+            c.value = cmd()
+            c.secondary = s / speedSpan
             cv.text = String.format(Locale.US, "%+.2f", c.value)
-            sv.text = String.format(Locale.US, "speed %+.0f", sp.value)
+            sv.text = String.format(Locale.US, "speed %+.0f", s)
         }
         return col
     }
@@ -188,7 +190,7 @@ class GuiUpdater(
         gauge("tilt", "deg", -10.0, 12.0, "%+7.2f") { thetaDeg }
         gauge("tilt rate", "deg/s", -200.0, 200.0, "%+7.1f") { angularVelocityDeg }
 
-        section("WHEELS  (command · speed)", inset = 40)
+        spacer()
         // Below ~40% of the screen height the robot's cradle covers the sides,
         // narrowing towards the bottom, so everything from here down is inset.
         val wheels = hstack().apply { gravity = Gravity.CENTER; setPadding(dp(48), 0, dp(48), 0) }
@@ -207,12 +209,11 @@ class GuiUpdater(
         }
         tile(r1, "step", null) { Pair(String.format(Locale.US, "%d", step), 0.0) }
         binding.rows.addView(r1)
-        val r2 = hstack().apply { setPadding(dp(40), dp(8), dp(40), 0) }
+        val r2 = hstack().apply { setPadding(dp(24), dp(8), dp(24), 0) }
         tile(r2, "count L", null) { Pair(String.format(Locale.US, "%d", wheelCountL), 0.0) }
         tile(r2, "count R", null) { Pair(String.format(Locale.US, "%d", wheelCountR), 0.0) }
-        tile(r2, "chg · coil V", null) {
-            Pair(String.format(Locale.US, "%.1f · %.1f", chargerVoltage, coilVoltage), 0.0)
-        }
+        tile(r2, "charger", null) { Pair(String.format(Locale.US, "%.2f V", chargerVoltage), 0.0) }
+        tile(r2, "coil", null) { Pair(String.format(Locale.US, "%.2f V", coilVoltage), 0.0) }
         binding.rows.addView(r2)
     }
 
@@ -227,10 +228,6 @@ class GuiUpdater(
             rewardBar.negative = color
             rewardBar.value = rewardAvg
             rewardBar.label = String.format(Locale.US, "%+.2f", rewardAvg)
-            binding.rewardEpisode.text = String.format(Locale.US,
-                "this episode %+.2f/step     last %s",
-                episodeMean,
-                if (lastEpisodeMean.isNaN()) "  -" else String.format(Locale.US, "%+.2f/step", lastEpisodeMean))
             updates.forEach { it() }
             // Always the same lines, so a longer status never moves the layout.
             val trainer = trainerStatus.substringBefore(" (")
