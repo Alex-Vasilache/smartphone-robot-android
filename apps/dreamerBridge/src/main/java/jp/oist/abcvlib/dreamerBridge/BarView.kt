@@ -27,15 +27,29 @@ class BarView(
     private val signed: Boolean,
     private val autoRange: Boolean = false,
     private val vertical: Boolean = false,
+    /** With [autoRange]: grow both ends together (true) or each on its own. */
+    private val symmetric: Boolean = true,
 ) : View(context) {
+
+    /** The range given at construction; [autoRange] grows past it and relaxes back. */
+    private val baseLo = lo
+    private val baseHi = hi
+
+    val low get() = lo
+    val high get() = hi
 
     var value: Double = 0.0
         set(v) {
             field = v
             if (autoRange && v.isFinite()) {
-                val span = max(max(abs(v) * 1.1, hi * 0.995), minAutoSpan)
-                hi = span
-                lo = if (signed) -span else 0.0
+                // Out-of-range values widen the scale at once; it then decays
+                // back to the base range (~15 s at the 10 Hz refresh).
+                hi = max(baseHi + (hi - baseHi) * DECAY, if (v > 0) v * 1.1 else baseHi)
+                lo = minOf(baseLo + (lo - baseLo) * DECAY, if (v < 0) v * 1.1 else baseLo)
+                if (symmetric && signed) {
+                    val span = max(hi, -lo)
+                    hi = span; lo = -span
+                }
             }
             invalidate()
         }
@@ -56,7 +70,6 @@ class BarView(
         if (v == Math.rint(v) || abs(v) >= 10) String.format(Locale.US, "%.0f", v)
         else String.format(Locale.US, "%.1f", v)
 
-    private val minAutoSpan = if (autoRange) max(abs(hi), abs(lo)) else 0.0
     private val density = resources.displayMetrics.density
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val zero = Paint().apply { color = Palette.ZERO; strokeWidth = 2f * density }
@@ -124,6 +137,8 @@ class BarView(
         canvas.drawPath(path, cap)
     }
 }
+
+private const val DECAY = 0.995
 
 /**
  * Colours from the dataviz skill's validated dark palette: a blue/red diverging

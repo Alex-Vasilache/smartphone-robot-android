@@ -78,7 +78,7 @@ class GuiUpdater(
 
     private fun spacer() {
         binding.rows.addView(android.view.View(activity),
-            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(10)))
     }
 
     private fun section(title: String, inset: Int = 0) {
@@ -102,7 +102,7 @@ class GuiUpdater(
     private val updates = mutableListOf<() -> Unit>()
 
     /** Tier 2: a large signed gauge -- label and big value above a thick bar. */
-    private fun gauge(label: String, unit: String, range: Double, format: String,
+    private fun gauge(label: String, unit: String, lo: Double, hi: Double, format: String,
                       read: () -> Double) {
         val head = hstack()
         head.addView(text(label, Palette.INK_2, 14f), weight())
@@ -110,12 +110,14 @@ class GuiUpdater(
         head.addView(value)
         head.addView(text(" $unit", Palette.INK_3, 12f))
         binding.rows.addView(head)
-        val bar = BarView(activity, -range, range, signed = true)
+        val bar = BarView(activity, lo, hi, signed = true, autoRange = true, symmetric = false)
         binding.rows.addView(bar, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, dp(22)).apply { topMargin = dp(2) })
         val ends = hstack()
-        ends.addView(text(String.format(Locale.US, "%+.0f", -range), Palette.INK_3, 10f), weight())
-        ends.addView(text(String.format(Locale.US, "%+.0f", range), Palette.INK_3, 10f))
+        val loText = text("", Palette.INK_3, 10f)
+        val hiText = text("", Palette.INK_3, 10f)
+        ends.addView(loText, weight())
+        ends.addView(hiText)
         binding.rows.addView(ends, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
             bottomMargin = dp(6)
@@ -124,6 +126,8 @@ class GuiUpdater(
             val v = read()
             value.text = String.format(Locale.US, format, v)
             bar.value = v
+            loText.text = String.format(Locale.US, "%+.0f", bar.low)
+            hiText.text = String.format(Locale.US, "%+.0f", bar.high)
         }
     }
 
@@ -131,16 +135,16 @@ class GuiUpdater(
      *  the command (thick) and the measured speed (thin, auto-ranged); up is forward. */
     private fun wheel(name: String, cmd: () -> Double, speed: () -> Double): LinearLayout {
         val col = vstack().apply { gravity = Gravity.CENTER_HORIZONTAL }
+        // The wheels take whatever height is left, so the screen is always full.
         col.addView(text(name, Palette.INK_2, 14f).apply { gravity = Gravity.CENTER })
         val bars = hstack().apply { gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL }
         val c = BarView(activity, -1.0, 1.0, signed = true, vertical = true)
         val sp = BarView(activity, -1.0, 1.0, signed = true, autoRange = true, vertical = true)
-        bars.addView(c, LinearLayout.LayoutParams(dp(48), dp(104)))
-        bars.addView(sp, LinearLayout.LayoutParams(dp(10), dp(104)).apply { marginStart = dp(6) })
-        col.addView(bars, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
-            topMargin = dp(4); bottomMargin = dp(4)
-        })
+        bars.addView(c, LinearLayout.LayoutParams(dp(56), LinearLayout.LayoutParams.MATCH_PARENT))
+        bars.addView(sp, LinearLayout.LayoutParams(dp(12), LinearLayout.LayoutParams.MATCH_PARENT)
+            .apply { marginStart = dp(6) })
+        col.addView(bars, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, 0, 1f)
+            .apply { topMargin = dp(6); bottomMargin = dp(6) })
         val cv = text("", Palette.INK, 22f, bold = true).apply { gravity = Gravity.CENTER }
         col.addView(cv)
         val sv = text("", Palette.INK_3, 11f).apply { gravity = Gravity.CENTER }
@@ -159,10 +163,9 @@ class GuiUpdater(
         t.addView(text(label, Palette.INK_3, 11f).apply { gravity = Gravity.CENTER })
         val v = text("", Palette.INK_2, 15f).apply { gravity = Gravity.CENTER }
         t.addView(v)
-        if (meter != null) {
-            t.addView(meter, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, dp(4)).apply { topMargin = dp(3) })
-        }
+        // Every tile reserves the meter row, so values line up across tiles.
+        t.addView(meter ?: android.view.View(activity), LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, dp(4)).apply { topMargin = dp(3) })
         row.addView(t, weight())
         updates += {
             val (s, x) = read()
@@ -179,19 +182,22 @@ class GuiUpdater(
         binding.rewardBar.addView(rewardBar,
             LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(64)))
 
-        section("BODY")
-        gauge("tilt", "deg", 30.0, "%+7.2f") { thetaDeg }
-        gauge("tilt rate", "deg/s", 200.0, "%+7.1f") { angularVelocityDeg }
+        spacer()
+        // The robot's working tilt is about -7 to +9 deg (its bumpers); the
+        // scale shows a little more and widens for anything beyond.
+        gauge("tilt", "deg", -10.0, 12.0, "%+7.2f") { thetaDeg }
+        gauge("tilt rate", "deg/s", -200.0, 200.0, "%+7.1f") { angularVelocityDeg }
 
         section("WHEELS  (command · speed)", inset = 40)
         // Below ~40% of the screen height the robot's cradle covers the sides,
         // narrowing towards the bottom, so everything from here down is inset.
         val wheels = hstack().apply { gravity = Gravity.CENTER; setPadding(dp(48), 0, dp(48), 0) }
-        wheels.addView(wheel("left", { actionL }, { wheelSpeedL }), weight())
-        wheels.addView(wheel("right", { actionR }, { wheelSpeedR }), weight())
-        binding.rows.addView(wheels)
+        val full = { LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f) }
+        wheels.addView(wheel("left", { actionL }, { wheelSpeedL }), full())
+        wheels.addView(wheel("right", { actionR }, { wheelSpeedR }), full())
+        binding.rows.addView(wheels, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
 
-        section("SYSTEM", inset = 40)
+        spacer(); spacer()
         val r1 = hstack().apply { setPadding(dp(40), 0, dp(40), 0) }
         tile(r1, "loop", BarView(activity, 0.0, 50.0, signed = false)) {
             Pair(String.format(Locale.US, "%.1f Hz", controlHz), controlHz)
@@ -201,15 +207,13 @@ class GuiUpdater(
         }
         tile(r1, "step", null) { Pair(String.format(Locale.US, "%d", step), 0.0) }
         binding.rows.addView(r1)
-        val r2 = hstack().apply { setPadding(dp(56), dp(8), dp(56), 0) }
-        tile(r2, "count L / R", null) {
-            Pair(String.format(Locale.US, "%d / %d", wheelCountL, wheelCountR), 0.0)
-        }
-        tile(r2, "charger · coil", null) {
-            Pair(String.format(Locale.US, "%.2f · %.2f V", chargerVoltage, coilVoltage), 0.0)
+        val r2 = hstack().apply { setPadding(dp(40), dp(8), dp(40), 0) }
+        tile(r2, "count L", null) { Pair(String.format(Locale.US, "%d", wheelCountL), 0.0) }
+        tile(r2, "count R", null) { Pair(String.format(Locale.US, "%d", wheelCountR), 0.0) }
+        tile(r2, "chg · coil V", null) {
+            Pair(String.format(Locale.US, "%.1f · %.1f", chargerVoltage, coilVoltage), 0.0)
         }
         binding.rows.addView(r2)
-        spacer()
     }
 
     fun displayValues() {
