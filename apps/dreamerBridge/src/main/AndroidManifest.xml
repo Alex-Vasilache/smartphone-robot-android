@@ -29,24 +29,16 @@
                 android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"
                 android:resource="@xml/device_filter" />
         </activity>
-        <!-- Dreamer Player: a second launcher that runs a saved policy with no
-             trainer. The picker lists them; the player runs in its own process. -->
+        <!-- Back from training opens the policy list; each screen has its own
+             process, since each control loop's Python only stops with it. -->
         <activity
             android:name=".PickerActivity"
-            android:exported="true"
-            android:label="@string/player_name"
-            android:taskAffinity="jp.oist.abcvlib.dreamerBridge.player">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-        </activity>
+            android:exported="false"
+            android:process=":picker" />
         <activity
             android:name=".PlayerActivity"
             android:exported="false"
-            android:label="@string/player_name"
-            android:process=":player"
-            android:taskAffinity="jp.oist.abcvlib.dreamerBridge.player" />
+            android:process=":player" />
     </application>
 
 </manifest>

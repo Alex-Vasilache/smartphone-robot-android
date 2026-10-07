@@ -299,7 +299,7 @@ def setup():
     if player_policy:
         setup_player(PolicyRunner)
     else:
-        runner = PolicyRunner(os.path.join(weights_dir(), 'policy.npz'))
+        runner = PolicyRunner(boot_policy())
     print('dreamerBridge: onboard policy %s' % (
         'ready (%s)' % runner.stamp if runner.ready else 'absent'))
     if runner.ready:
@@ -846,6 +846,66 @@ def weights_dir():
     return os.path.join(str(context.getFilesDir()), 'dreamer_policy')
 
 
+def policies_dir():
+    """Saved policies, one <name>.npz + <name>.json each: what the policy
+    list shows. Each training run keeps its latest weights here under the
+    run's name; tools/save_policy.sh adds others."""
+    return os.path.join(str(context.getExternalFilesDir(None)), 'policies')
+
+
+def boot_policy():
+    """The weights to start on: the last ones pushed, wherever they went."""
+    try:
+        with open(os.path.join(weights_dir(), 'boot.json')) as f:
+            path = json.load(f)['path']
+        if os.path.exists(path):
+            return path
+    except Exception:  # noqa: BLE001 -- no record yet: the old location
+        pass
+    return os.path.join(weights_dir(), 'policy.npz')
+
+
+def weight_saver(run, settings):
+    """What the receiver thread does with each weight push.
+
+    A trainer that names its run gets its weights kept in the policy list as
+    <run>.npz, overwritten by every push, so the latest weights of every run
+    stay available to replay without saving anything by hand. The sidecar
+    carries the rate and reward settings the player needs. Without a name
+    (an older trainer) they go where they always did.
+    """
+    from policy_runner import PolicyRunner
+    if not run:
+        path = os.path.join(weights_dir(), 'policy.npz')
+        return lambda blob, header: PolicyRunner.build_blob(blob, path)
+    name = ''.join(c if c.isalnum() or c in '-_.' else '_' for c in run)
+    path = os.path.join(policies_dir(), name + '.npz')
+    side = dict(settings or {}, name=name, run=run, job=run, hz=max_hz)
+
+    def save(blob, header):
+        policy = PolicyRunner.build_blob(blob, path)
+        stamp = str(header.get('stamp', ''))
+        side['stamp'] = stamp
+        try:
+            side['published'] = time.strftime(
+                '%Y-%m-%d %H:%M', time.localtime(int(stamp) / 1e9))
+        except ValueError:
+            pass
+        write_json(os.path.splitext(path)[0] + '.json', side)
+        write_json(os.path.join(weights_dir(), 'boot.json'), dict(path=path))
+        return policy
+
+    return save
+
+
+def write_json(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(data, f, indent=1)
+    os.replace(tmp, path)
+
+
 def wait_for_pace():
     """Block until it is time to decide: see PACE."""
     if pace == 'serial':
@@ -1110,10 +1170,8 @@ def connect():
         if pace == 'serial' and max_hz > 0:
             mode += ' <= %g Hz' % max_hz
         global receiver
-        from policy_runner import PolicyRunner
-        directory = weights_dir()
         receiver = bridge_link.Receiver(
-            sock, build=lambda blob: PolicyRunner.build_blob(blob, directory),
+            sock, build=weight_saver(hello.get('run'), hello.get('settings')),
             initial=bytes(buffer), timeout=RECV_TIMEOUT)
         buffer.clear()
         if no_base:

@@ -28,8 +28,9 @@ import time
 class Receiver:
 
   def __init__(self, sock, build=None, initial=b'', timeout=30.0):
-    """`build(blob)` turns a pushed weight blob into whatever the control loop
-    installs; it runs on the receiver thread. None passes the blob through."""
+    """`build(blob, header)` turns a pushed weight blob into whatever the
+    control loop installs; it runs on the receiver thread. None passes the
+    blob through."""
     self.sock = sock
     self.build = build
     self.timeout = timeout
@@ -125,7 +126,7 @@ class Receiver:
   def _weights(self, header, blob):
     t0 = time.monotonic()
     try:
-      payload = self.build(blob) if self.build else blob
+      payload = self.build(blob, header) if self.build else blob
     except Exception as e:  # noqa: BLE001 -- a bad push must not end the link
       print('dreamerBridge: bad weight update %s: %s' % (header.get('stamp'), e))
       return

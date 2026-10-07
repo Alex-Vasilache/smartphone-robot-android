@@ -2,7 +2,10 @@ package jp.oist.abcvlib.dreamerBridge
 
 import android.content.Context
 import android.net.wifi.WifiManager
+import android.content.Intent
 import android.os.Bundle
+import android.os.Process
+import androidx.activity.addCallback
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -65,6 +68,17 @@ open class MainActivity : AbcvlibActivity(), SerialReadyListener {
             acquire()
         }
         super.onCreate(savedInstanceState)
+        // Training mode: back goes to the policy list (PickerActivity), which
+        // can replay any saved policy or come back here. Python cannot stop in
+        // place, so leaving training ends this process; the base stops the
+        // wheels by itself 250 ms after the commands stop.
+        if (this !is PlayerActivity) {
+            onBackPressedDispatcher.addCallback(this) {
+                startActivity(Intent(this@MainActivity, PickerActivity::class.java))
+                finish()
+                Process.killProcess(Process.myPid())
+            }
+        }
         // No base: the serial link never comes up, so onSerialReady never
         // fires. Start the bridge anyway; main.py skips the serial and wheels.
         if (noBase()) {
