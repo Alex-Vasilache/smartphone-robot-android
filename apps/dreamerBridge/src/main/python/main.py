@@ -222,6 +222,14 @@ receiver = None
 # which is what makes it a test of the link at a given rate. Set with
 # "no_base": true in trainer.json; MainActivity then starts without USB.
 no_base = False
+# Player mode (the Dreamer Player launcher): run one saved policy with no
+# trainer at all. `player_policy` is the .npz path, injected by abcvlib.py;
+# its <name>.json sidecar (tools/save_policy.sh) gives the rate, episode length
+# and reward settings, so the screen scores steps the way training did.
+player_policy = None
+player_eval = True
+player = None      # the sidecar dict once loaded
+prev_act = (0.0, 0.0)
 pipeline = True
 imu_stamp = 0.0     # monotonic time of the last orientation callback
 imu_age_ms = 0.0    # sensor hardware time to callback, milliseconds
@@ -288,7 +296,10 @@ def setup():
         except Exception as e:  # noqa: BLE001
             print('dreamerBridge: could not pin the control thread: %s' % e)
     from policy_runner import PolicyRunner
-    runner = PolicyRunner(os.path.join(weights_dir(), 'policy.npz'))
+    if player_policy:
+        setup_player(PolicyRunner)
+    else:
+        runner = PolicyRunner(os.path.join(weights_dir(), 'policy.npz'))
     print('dreamerBridge: onboard policy %s' % (
         'ready (%s)' % runner.stamp if runner.ready else 'absent'))
     if runner.ready:
@@ -333,9 +344,82 @@ def setup():
         serial.setReplyTimeoutMs(REPLY_TIMEOUT_MS)
         context.setSerialCommManager(serial)
         context.onSetupReady()
+    if player:
+        context.guiUpdater.setTrainerStatus('playing %s' % player['name'])
+        return
     settings = trainer_settings()
     context.guiUpdater.setTrainerStatus('connecting to %s:%s' % (
         settings['ip'], settings['port']))
+
+
+def setup_player(PolicyRunner):
+    """Load the chosen policy and its settings; no trainer will connect."""
+    global runner, player, onboard, max_hz, cmd_scale, pace
+    path = str(player_policy)
+    side = os.path.splitext(path)[0] + '.json'
+    player = dict(name=os.path.basename(os.path.splitext(path)[0]), hz=MAX_HZ,
+                  length=500, command_scale=1.0)
+    try:
+        with open(side) as f:
+            player.update(json.load(f))
+    except Exception as e:  # noqa: BLE001 -- run on defaults rather than not at all
+        print('dreamerBridge: no settings for %s (%s); using defaults' % (path, e))
+    runner = PolicyRunner()
+    runner.load_path(path, stamp=player['name'])
+    runner.mode = 'eval' if player_eval else 'train'
+    # `onboard` turns on the warm-up before each step, as when training.
+    onboard = True
+    max_hz = float(player['hz'])
+    cmd_scale = float(player.get('command_scale', 1.0))
+    pace = PACE
+    print('dreamerBridge: player running %s at %g Hz (%s actions)' % (
+        player['name'], max_hz, runner.mode))
+
+
+def player_reward(sensors, act):
+    """The training reward (embodied/envs/robot.py, task balance), for display."""
+    global prev_act
+    p = player
+    if 'theta_zero' not in p:
+        return 0.0
+    offset = float(sensors['theta']) - p['theta_zero']
+    reach = p['theta_hi'] if offset > 0 else abs(p['theta_lo'])
+    linear = 1.0 - min(1.0, abs(offset) / max(reach, 1e-6))
+    bonus = math.exp(-(offset / p['theta_sigma']) ** 2)
+    left = float(sensors['wheel_speed_l']) * p['speed_scale']
+    right = float(sensors['wheel_speed_r']) * p['speed_scale']
+    clip = p['drift_clip']
+    reward = (0.5 * linear + 0.5 * bonus
+              - p['rate_penalty'] * abs(float(sensors['angular_velocity']))
+              - p['drift_penalty'] * min(abs(0.5 * (left + right)), clip)
+              - p['wheel_penalty'] * 0.5 * (min(abs(left), clip)
+                                            + min(abs(right), clip)))
+    if p.get('action_rate_penalty'):
+        reward -= p['action_rate_penalty'] * 0.5 * (
+            abs(act[0] - prev_act[0]) + abs(act[1] - prev_act[1]))
+    prev_act = (act[0], act[1])
+    return reward
+
+
+def loop_player():
+    """One control step of a saved policy: the onboard path minus the trainer."""
+    global step, prev_act
+    wait_for_pace()
+    snap, _, _ = sample()
+    _, act = runner.act(snap)
+    drive(act[0], act[1])
+    note_reward(player_reward(snap, act))
+    step += 1
+    if step >= int(player['length']):
+        # Episodes as long as in training: the policy never saw a longer
+        # context, so start its memory afresh. The wheels keep going.
+        end_episode()
+        runner.reset()
+        prev_act = (0.0, 0.0)
+        step = 0
+    if prepare_ahead:
+        runner.prepare()
+    update_gui()
 
 
 def sample():
@@ -394,6 +478,8 @@ def latency_block(taken_at, sensor_stamp, sensor_age_ms):
 def loop():
     """One control step, or one reconnect attempt if we are not connected."""
     global step, next_tick, last_act
+    if player is not None:
+        return loop_player()
     if sock is None:
         if standalone and runner is not None and runner.ready:
             # No trainer, but we still have the policy that was balancing a
@@ -528,7 +614,7 @@ def update_gui():
     """Mirror the current step onto the phone screen, at a human rate."""
     global last_report, last_gui, control_hz
     now = time.monotonic()
-    if sock is None:
+    if sock is None and player is None:
         # Idle refresh rate is not the control rate; do not let it pollute it.
         control_hz = 0.0
         last_report = 0.0

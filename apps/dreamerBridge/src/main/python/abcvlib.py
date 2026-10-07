@@ -22,6 +22,9 @@ import main
 
 loop_delay = 0.0
 context = None
+# Set by PlayerActivity: run this saved policy with no trainer (see main.py).
+player_policy = None
+player_eval = True
 
 _lock = threading.Lock()
 _started = False
@@ -30,6 +33,8 @@ _started = False
 def run():
     global _started
     main.context = context
+    main.player_policy = player_policy
+    main.player_eval = player_eval
     with _lock:
         first = not _started
         _started = True

@@ -20,7 +20,7 @@ import kotlinx.coroutines.launch
 import org.json.JSONObject
 import java.io.File
 
-class MainActivity : AbcvlibActivity(), SerialReadyListener {
+open class MainActivity : AbcvlibActivity(), SerialReadyListener {
     // keep them public to be visible for python
     lateinit var binding: ActivityMainBinding
     lateinit var guiUpdater: GuiUpdater
@@ -104,6 +104,9 @@ class MainActivity : AbcvlibActivity(), SerialReadyListener {
         // CONTROL_HZ, so the bridge must not add a delay of its own.
         setupModule.put("loop_delay", 0.0)
         setupModule.put("context", this)
+        // Set only when started from the player's picker (PlayerActivity).
+        setupModule.put("player_policy", intent.getStringExtra(EXTRA_POLICY))
+        setupModule.put("player_eval", intent.getBooleanExtra(EXTRA_EVAL, true))
 
         lifecycleScope.launch(Dispatchers.Default) {
             try {
@@ -121,5 +124,9 @@ class MainActivity : AbcvlibActivity(), SerialReadyListener {
     fun onSetupReady() {
         super.onSerialReady(usbSerial)
     }
-}
 
+    companion object {
+        const val EXTRA_POLICY = "jp.oist.abcvlib.dreamerBridge.POLICY"
+        const val EXTRA_EVAL = "jp.oist.abcvlib.dreamerBridge.EVAL"
+    }
+}

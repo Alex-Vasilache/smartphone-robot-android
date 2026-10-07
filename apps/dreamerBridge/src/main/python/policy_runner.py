@@ -42,6 +42,9 @@ class PolicyRunner:
     self.last_prepare_ms = 0.0
     self.errors = 0
     self._pre = None      # (carry, is_first, deter) from prepare(), if valid
+    # 'train' samples the action, as while collecting; 'eval' takes the
+    # distribution's mode, for running a finished policy (the player).
+    self.mode = 'train'
     self.prepared = 0     # steps that used a prepared half
     if path and os.path.exists(path):
       self.load_path(path, stamp='initial')
@@ -155,7 +158,7 @@ class PolicyRunner:
       self.prepared += 1
     else:
       deter = self.policy.precompute(self.carry, self.is_first)
-    act, self.carry = self.policy.finish(obs, self.carry, deter, mode='train')
+    act, self.carry = self.policy.finish(obs, self.carry, deter, mode=self.mode)
     self.is_first = False
     self.steps += 1
     self.last_ms = (time.monotonic() - t0) * 1e3
