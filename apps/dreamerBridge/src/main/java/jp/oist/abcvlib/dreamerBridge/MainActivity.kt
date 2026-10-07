@@ -17,6 +17,8 @@ import jp.oist.abcvlib.util.SerialReadyListener
 import jp.oist.abcvlib.util.UsbSerial
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import org.json.JSONObject
+import java.io.File
 
 class MainActivity : AbcvlibActivity(), SerialReadyListener {
     // keep them public to be visible for python
@@ -63,6 +65,19 @@ class MainActivity : AbcvlibActivity(), SerialReadyListener {
             acquire()
         }
         super.onCreate(savedInstanceState)
+        // No base: the serial link never comes up, so onSerialReady never
+        // fires. Start the bridge anyway; main.py skips the serial and wheels.
+        if (noBase()) {
+            Logger.i("MainActivity", "no_base set in trainer.json; starting without the robot")
+            initPython()
+        }
+    }
+
+    private fun noBase(): Boolean = try {
+        val file = File(getExternalFilesDir(null), "trainer.json")
+        file.exists() && JSONObject(file.readText()).optBoolean("no_base", false)
+    } catch (e: Exception) {
+        false
     }
 
     override fun onDestroy() {

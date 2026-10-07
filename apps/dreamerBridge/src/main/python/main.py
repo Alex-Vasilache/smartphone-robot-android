@@ -41,6 +41,7 @@ import math
 import os
 import socket
 import struct
+import sys
 import time
 
 from android.os import SystemClock
@@ -54,6 +55,8 @@ from jp.oist.abcvlib.core.inputs.phone import (
 from jp.oist.abcvlib.util import (
     ControlLatencyTrace, SensorLatencyTrace, SerialCommManager)
 from jp.oist.abcvlib.dreamerBridge import SensorSnapshot
+
+import bridge_link
 
 PROTOCOL = 3
 CONTROL_HZ = 50.0
@@ -209,9 +212,16 @@ standalone = False
 runner = None
 
 sock = None
-# Own framing buffer instead of a buffered file object: the pipelined loop has
-# to ask "is an action here?" without blocking, which file.read cannot do.
+# Own framing buffer instead of a buffered file object, for the handshake only;
+# after it the socket belongs to `receiver` (bridge_link.Receiver), a thread
+# that reads it and parses pushed weights so the control loop never does.
 buffer = bytearray()
+receiver = None
+# No base on the phone: no serial link and no wheels. Everything else -- the
+# sensors, the policy, the trainer link and the pacing -- runs as on the robot,
+# which is what makes it a test of the link at a given rate. Set with
+# "no_base": true in trainer.json; MainActivity then starts without USB.
+no_base = False
 pipeline = True
 imu_stamp = 0.0     # monotonic time of the last orientation callback
 imu_age_ms = 0.0    # sensor hardware time to callback, milliseconds
@@ -226,6 +236,7 @@ drive_ms = 0.0    # cost of handing one action to the serial writer
 pace = PACE        # negotiated per connection
 max_hz = MAX_HZ    # negotiated per connection
 cmd_scale = 1.0    # every wheel command is multiplied by this (trainer's hello)
+weights_installed = 0  # weight pushes swapped in this session
 reward_avg = 0.0   # display only, see note_reward
 ep_return = 0.0
 ep_steps = 0
@@ -262,7 +273,12 @@ last_stale_warning = 0.0
 
 
 def setup():
-    global runner
+    global runner, no_base
+    no_base = bool(trainer_settings().get('no_base', False))
+    # The receiver thread parses weight pushes in Python. At the default 5 ms
+    # switch interval it could hold the GIL for that long while the control
+    # thread waits to decide; 1 ms bounds the wait to a fraction of a tick.
+    sys.setswitchinterval(0.001)
     # Built before the first connection so the handshake can honestly say
     # whether we can act on our own. With no weights on disk yet this is a
     # runner that is not `ready`, and the trainer keeps the policy.
@@ -310,10 +326,13 @@ def setup():
     publisher_manager.initializePublishers()
     publisher_manager.startPublishers()
 
-    serial = SerialCommManager(context.usbSerial, battery_data, wheel_data)
-    serial.setReplyTimeoutMs(REPLY_TIMEOUT_MS)
-    context.setSerialCommManager(serial)
-    context.onSetupReady()
+    if no_base:
+        print('dreamerBridge: no base -- no serial link, wheels not driven')
+    else:
+        serial = SerialCommManager(context.usbSerial, battery_data, wheel_data)
+        serial.setReplyTimeoutMs(REPLY_TIMEOUT_MS)
+        context.setSerialCommManager(serial)
+        context.onSetupReady()
     settings = trainer_settings()
     context.guiUpdater.setTrainerStatus('connecting to %s:%s' % (
         settings['ip'], settings['port']))
@@ -422,20 +441,18 @@ def loop():
                 frame = read_nowait()
                 if frame is None:
                     break
-                header, blob = frame
-                if header.get('type') == 'weights':
+                header, payload = frame
+                if header.get('type') == 'weights_ready':
                     # Bootstrap: we came up without a policy, so the trainer is
                     # still driving. Once its weights land we can take over,
                     # but onboard mode is settled at handshake -- so drop the
                     # link and let the next connect negotiate it.
-                    if runner.load_blob(blob, header.get('stamp'),
-                                        weights_dir()):
-                        print('dreamerBridge: got a policy, reconnecting to '
-                              'take over control')
-                        stop_wheels()
-                        disconnect()
-                        return
-                    continue
+                    runner.install(payload, header.get('stamp'))
+                    print('dreamerBridge: got a policy, reconnecting to '
+                          'take over control')
+                    stop_wheels()
+                    disconnect()
+                    return
                 act = header
         else:
             act = read()
@@ -598,6 +615,8 @@ def loop_onboard():
                prepared=runner.prepared,
                drive_ms=drive_ms,
                policy_stamp=runner.stamp,
+               weights_installed=weights_installed,
+               build_ms=receiver.last_build_ms if receiver else 0.0,
                sensors=snap,
                **latency_block(tick, snap_stamp, snap_age)))
     step += 1
@@ -657,15 +676,15 @@ def loop_trainer_serial():
     while True:
         frame = read_nowait()
         while frame is not None:
-            header, blob = frame
+            header, payload = frame
             kind = header.get('type')
-            if kind == 'weights':
-                if runner.load_blob(blob, header.get('stamp'), weights_dir()):
-                    print('dreamerBridge: got a policy, reconnecting to '
-                          'take over control')
-                    stop_wheels()
-                    disconnect()
-                    return
+            if kind == 'weights_ready':
+                runner.install(payload, header.get('stamp'))
+                print('dreamerBridge: got a policy, reconnecting to '
+                      'take over control')
+                stop_wheels()
+                disconnect()
+                return
             elif kind == 'act' and header.get('seq', seq) == seq:
                 act = header
             frame = read_nowait()
@@ -706,23 +725,23 @@ def drain_control():
     """Take whatever the trainer has sent, without blocking the control loop.
 
     Resets and weight updates are not latency critical, so they are handled
-    after the wheels have already been driven for this tick. A weight blob is
-    megabytes and arrives over many ticks; parse() only yields it once it is
-    whole, so a partial one simply sits in the buffer.
+    after the wheels have already been driven for this tick. A weight push
+    reaches us already parsed (bridge_link.Receiver did that on its own
+    thread), so installing it is an assignment.
     """
-    global step
+    global step, weights_installed
     budget = time.monotonic() + 0.004
     while time.monotonic() < budget:
         frame = read_nowait()
         if frame is None:
             break
-        header, blob = frame
+        header, payload = frame
         kind = header.get('type')
-        if kind == 'weights':
+        if kind == 'weights_ready':
             stamp = header.get('stamp')
-            if runner.load_blob(blob, stamp, weights_dir()):
-                print('dreamerBridge: policy updated to %s' % stamp)
-                context.guiUpdater.setTrainerStatus('policy %s' % stamp)
+            runner.install(payload, stamp)
+            weights_installed += 1
+            context.guiUpdater.setTrainerStatus('policy %s' % stamp)
         elif kind in ('act', 'ctrl'):
             apply_overrides(header)
             note_reward(float(header.get('reward', 0.0)))
@@ -755,6 +774,11 @@ def wait_for_serial(lead_ms=0.0):
     before the next decision slot. Returns how long that took, in ms."""
     global serial_ok, last_serial_warning, serial_misses
     t0 = time.monotonic()
+    if no_base:
+        # No RP2040 to wait for: hold to the max_hz grid alone.
+        if max_hz > 0 and next_slot:
+            wait_for_slot(next_slot - lead_ms / 1e3)
+        return (time.monotonic() - t0) * 1e3
     deadline = t0 + SERIAL_WAIT_MAX_MS / 1e3
     warmed = False
     while True:
@@ -908,7 +932,8 @@ def drive(left, right):
     if zero_mode != 'coast':
         left, lb = zero_fix(left, last_command[0])
         right, rb = zero_fix(right, last_command[1])
-    context.outputs.setWheelOutput(left, right, lb, rb, float(slew_max))
+    if not no_base:
+        context.outputs.setWheelOutput(left, right, lb, rb, float(slew_max))
     last_command = requested
     drive_ms = (time.monotonic() - t0) * 1e3
     cycle_ms = (t0 - last_drive) * 1e3 if last_drive else 0.0
@@ -930,6 +955,8 @@ def drive(left, right):
 
 
 def stop_wheels():
+    if no_base:
+        return
     if context is not None and context.outputs is not None:
         context.outputs.setWheelOutput(0.0, 0.0, True, True)
         context.guiUpdater.setLastAction('stopped')
@@ -965,7 +992,9 @@ def connect():
         write(dict(type='hello', protocol=PROTOCOL, control_hz=CONTROL_HZ,
                    robot_id=ROBOT_ID, onboard=bool(runner and runner.ready),
                    policy_stamp=(runner.stamp if runner else None),
-                   pace=PACE, max_hz=float(settings['max_hz'])))
+                   pace=PACE, max_hz=float(settings['max_hz']),
+                   # We reassemble weight pushes sent in slices.
+                   wchunk=True))
         hello = read()
         if hello['type'] != 'hello' or hello['protocol'] != PROTOCOL:
             raise ValueError('Unexpected handshake %r' % hello)
@@ -994,6 +1023,15 @@ def connect():
         mode = ('pipelined' if pipeline else 'lock-step') + ', ' + pace + ' paced'
         if pace == 'serial' and max_hz > 0:
             mode += ' <= %g Hz' % max_hz
+        global receiver
+        from policy_runner import PolicyRunner
+        directory = weights_dir()
+        receiver = bridge_link.Receiver(
+            sock, build=lambda blob: PolicyRunner.build_blob(blob, directory),
+            initial=bytes(buffer), timeout=RECV_TIMEOUT)
+        buffer.clear()
+        if no_base:
+            mode += ', no base'
         print('dreamerBridge: connected to %s:%d (%s)' % (address + (mode,)))
         context.guiUpdater.setTrainerStatus(
             'connected to %s:%d (%s)' % (address + (mode,)))
@@ -1004,7 +1042,10 @@ def connect():
 
 
 def disconnect():
-    global sock
+    global sock, receiver
+    if receiver is not None:
+        receiver.close()
+        receiver = None
     try:
         sock and sock.close()
     except OSError:
@@ -1021,6 +1062,8 @@ def write(header, blob=b''):
 
 def read():
     """Block for the next complete frame. Returns the header only."""
+    if receiver is not None:
+        return receiver.get()[0]
     while True:
         frame = parse()
         if frame is not None:
@@ -1035,7 +1078,12 @@ def read_nowait():
     keeps pulling until the socket is drained rather than taking one 64KB
     bite per control tick -- at 50Hz that would stretch a 5MB update over
     nearly two seconds.
+
+    Once connected the receiver thread owns the socket, and this only takes
+    what it has finished.
     """
+    if receiver is not None:
+        return receiver.get_nowait()
     frame = parse()
     if frame is not None:
         return frame

@@ -53,9 +53,16 @@ class PolicyRunner:
     return self.policy is not None
 
   def load_path(self, path, stamp):
-    policy = NumpyPolicy(path)
-    # Only swap once the new weights have parsed. A half-loaded policy on a
-    # balancing robot is worse than slightly stale weights.
+    return self.install(NumpyPolicy(path), stamp)
+
+  def install(self, policy, stamp):
+    """Swap in an already-parsed policy. Cheap: safe on the control thread.
+
+    Only swap once the new weights have parsed. A half-loaded policy on a
+    balancing robot is worse than slightly stale weights. The RSSM carry is
+    kept across the swap -- same shapes, and resetting it mid-episode would
+    hand the new weights a state they never saw at that point of an episode.
+    """
     self.policy = policy
     self.stamp = stamp
     self._pre = None
@@ -63,16 +70,25 @@ class PolicyRunner:
       self.carry = policy.initial()
     return policy.meta
 
+  @staticmethod
+  def build_blob(blob, directory):
+    """Persist pushed weights and parse them; the slow half of an update.
+
+    Touches nothing the control loop reads, so it can run on any thread (see
+    bridge_link.Receiver); `install` the result on the control thread.
+    """
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(suffix='.npz', dir=directory)
+    with os.fdopen(fd, 'wb') as f:
+      f.write(blob)
+    final = os.path.join(directory, 'policy.npz')
+    os.replace(tmp, final)
+    return NumpyPolicy(final)
+
   def load_blob(self, blob, stamp, directory):
     """Install weights pushed by the trainer. Returns True if they took."""
     try:
-      os.makedirs(directory, exist_ok=True)
-      fd, tmp = tempfile.mkstemp(suffix='.npz', dir=directory)
-      with os.fdopen(fd, 'wb') as f:
-        f.write(blob)
-      final = os.path.join(directory, 'policy.npz')
-      os.replace(tmp, final)
-      self.load_path(final, stamp)
+      self.install(self.build_blob(blob, directory), stamp)
       return True
     except Exception as e:  # noqa: BLE001 -- never let this stop the robot
       self.errors += 1
