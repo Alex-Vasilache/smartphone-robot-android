@@ -71,6 +71,13 @@ class CommandSource:
         """A joystick position, from the web server's thread."""
         forward = max(-1.0, min(1.0, float(forward)))
         turn = max(-1.0, min(1.0, float(turn)))
+        # On the run's grid, if it has one: a policy trained on the five
+        # levels -1, -0.5, 0, 0.5, 1 never saw anything in between. The page
+        # snaps too; this covers any other client.
+        step = float(self.settings.get('step') or 0.0)
+        if step > 0:
+            forward = round(forward / step) * step
+            turn = round(turn / step) * step
         with self._lock:
             self._stick = (forward, turn)
             self._stick_at = time.monotonic()

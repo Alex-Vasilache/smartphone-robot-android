@@ -57,6 +57,8 @@
   .dot { position: absolute; width: 14px; height: 14px; margin: -7px 0 0 -7px; border-radius: 50%;
     pointer-events: none; left: 50%; top: 50%; }
   #target { border: 3px solid var(--yellow); }
+  .gridpt { position: absolute; width: 6px; height: 6px; margin: -3px 0 0 -3px; border-radius: 50%;
+    background: var(--zero); pointer-events: none; }
   #actual { background: var(--blue); }
   .legend { display: flex; justify-content: center; gap: 16px; color: var(--ink3); font-size: 11px; }
   .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 5px; vertical-align: -1px; }
@@ -107,6 +109,7 @@
       <span class="cap" style="bottom:3%;left:50%;transform:translateX(-50%)">BACK</span>
       <span class="cap" style="left:3%;top:50%;transform:translateY(-50%)">L</span>
       <span class="cap" style="right:3%;top:50%;transform:translateY(-50%)">R</span>
+      <div id="grid"></div>
       <div id="knob"></div>
       <div class="dot" id="actual"></div>
       <div class="dot" id="target"></div>
@@ -225,10 +228,31 @@ function sendSoon() {
   setTimeout(() => { queued = false; lastSend = performance.now(); send(); },
              Math.max(0, 40 - (performance.now() - lastSend)));
 }
+// The run's command grid (0: continuous). With one, the stick snaps to it
+// and its points are drawn on the pad; each axis is then clamped on its own,
+// so the corners (e.g. forward 1 + turn 1) can be reached.
+let step = 0;
+function snap(v) { return step > 0 ? Math.round(v / step) * step : v; }
+function drawGrid(s) {
+  if (s === step) return;
+  step = s;
+  const g = $("grid"); g.innerHTML = "";
+  if (step <= 0) return;
+  const n = Math.round(1 / step);
+  for (let i = -n; i <= n; i++) for (let j = -n; j <= n; j++) {
+    const d = document.createElement("div"); d.className = "gridpt";
+    place(d, clamp(i * step, -1, 1), clamp(j * step, -1, 1));
+    g.appendChild(d);
+  }
+}
 function fromEvent(e) {
   const r = pad.getBoundingClientRect();
   let x = (e.clientX - r.left) / r.width * 2 - 1, y = -((e.clientY - r.top) / r.height * 2 - 1);
   x /= 0.8; y /= 0.8;   // the outer ring is full deflection
+  if (step > 0) {
+    x = clamp(x, -1, 1); y = clamp(y, -1, 1);
+    return { forward: snap(y), turn: snap(x) };
+  }
   const n = Math.hypot(x, y);
   if (n > 1) { x /= n; y /= n; }
   // A small dead zone, so a resting thumb means "balance".
@@ -308,6 +332,7 @@ const wl = wheel("m-wl", "left"), wr = wheel("m-wr", "right");
 const SRC = { joystick: "joystick", auto: "random", idle: "balance" };
 function render(s) {
   const cmd = s.cmd || [0, 0], meas = s.measured;
+  drawGrid(s.grid || 0);
   // drive view
   if (!stick) place(knob, 0, 0);
   place($("target"), cmd[0], cmd[1]);

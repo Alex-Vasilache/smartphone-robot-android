@@ -742,7 +742,8 @@ def web_state():
         coil=float(sensors['coil_voltage']),
         status=web_status[0], serial=web_status[1],
         cmd=list(commands.current), cmd_src=commands.source,
-        mode=commands.settings['mode'], measured=measured)
+        mode=commands.settings['mode'], measured=measured,
+        grid=float(commands.settings.get('step') or 0.0))
 
 
 def loop_onboard():
