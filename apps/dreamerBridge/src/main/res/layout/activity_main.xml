@@ -61,7 +61,7 @@
         android:layout_marginBottom="72dp"
         android:gravity="center"
         android:fontFamily="monospace"
-        android:lines="2"
+        android:lines="3"
         android:ellipsize="end"
         android:textColor="#FF707070"
         android:textSize="11sp" />

@@ -1,0 +1,323 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="theme-color" content="#1a1a19">
+<title>Robot Joystick</title>
+<style>
+  :root {
+    --surface: #1a1a19; --raised: #242422; --track: #383835; --zero: #8a8985;
+    --ink: #ffffff; --ink2: #c3c2b7; --ink3: #8a8985;
+    --blue: #6a9fd8; --red: #d98080; --yellow: #d9b45a;
+    --mono: ui-monospace, "SF Mono", Menlo, "Roboto Mono", monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--surface); color: var(--ink);
+    font-family: var(--mono); -webkit-tap-highlight-color: transparent; }
+  body { display: flex; flex-direction: column; overscroll-behavior: none; }
+  header { display: flex; align-items: center; gap: 8px; padding: 10px 16px 6px; }
+  header .tab { flex: 1; padding: 10px 0; border: 1px solid var(--track); border-radius: 8px;
+    background: none; color: var(--ink3); font: inherit; font-size: 14px; letter-spacing: .08em; }
+  header .tab.on { background: var(--raised); color: var(--ink); border-color: var(--zero); }
+  #link { width: 10px; height: 10px; border-radius: 50%; background: var(--red); flex: none; }
+  #link.ok { background: var(--blue); }
+  main { flex: 1; display: none; flex-direction: column; padding: 4px 16px 16px; min-height: 0; }
+  main.on { display: flex; }
+  main > * { flex-shrink: 0; }
+  main #padwrap { flex-shrink: 1; }
+  .label { color: var(--ink3); font-size: 11px; font-weight: bold; letter-spacing: .12em; margin: 10px 0 6px; }
+  .row { display: flex; gap: 8px; }
+  .tile { flex: 1; background: var(--raised); border-radius: 8px; padding: 8px 6px; text-align: center; min-width: 0; }
+  .tile .k { color: var(--ink3); font-size: 11px; }
+  .tile .v { color: var(--ink2); font-size: 16px; margin-top: 2px; white-space: nowrap; }
+  .tile .sub { color: var(--ink3); font-size: 11px; margin-top: 2px; white-space: nowrap; }
+  .bar { position: relative; height: 22px; background: var(--track); border-radius: 6px; overflow: hidden; }
+  .bar .fill { position: absolute; top: 0; bottom: 0; }
+  .bar .zero { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--zero); }
+  .bar .text { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    font-weight: bold; text-shadow: 0 0 4px #000; }
+
+  /* drive */
+  .modes { display: flex; gap: 8px; }
+  .modes button { flex: 1; padding: 10px 6px; border-radius: 8px; border: 1px solid var(--track);
+    background: none; color: var(--ink3); font: inherit; font-size: 12px; line-height: 1.3; }
+  .modes button.on { color: var(--ink); border-color: var(--blue); background: #6a9fd822; }
+  #padwrap { flex: 1; display: flex; align-items: center; justify-content: center; min-height: 0; padding: 12px 0; }
+  #pad { position: relative; width: min(100%, 52vh, 420px); aspect-ratio: 1; border-radius: 50%;
+    background: radial-gradient(circle, var(--raised) 0 69%, var(--track) 70% 71%, var(--raised) 72%);
+    border: 2px solid var(--track); touch-action: none; user-select: none; }
+  #pad .axis { position: absolute; background: var(--track); }
+  #pad .h { left: 6%; right: 6%; top: 50%; height: 1px; }
+  #pad .vt { top: 6%; bottom: 6%; left: 50%; width: 1px; }
+  #pad .cap { position: absolute; color: var(--ink3); font-size: 11px; letter-spacing: .08em; }
+  #knob { position: absolute; width: 22%; aspect-ratio: 1; border-radius: 50%; left: 50%; top: 50%;
+    transform: translate(-50%, -50%); background: #c3c2b799; box-shadow: 0 2px 10px #000a; pointer-events: none; }
+  #pad.held #knob { background: #ffffffaa; }
+  .dot { position: absolute; width: 14px; height: 14px; margin: -7px 0 0 -7px; border-radius: 50%;
+    pointer-events: none; left: 50%; top: 50%; }
+  #target { border: 3px solid var(--yellow); }
+  #actual { background: var(--blue); }
+  .legend { display: flex; justify-content: center; gap: 16px; color: var(--ink3); font-size: 11px; }
+  .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 5px; vertical-align: -1px; }
+
+  /* mirror */
+  #mirror { overflow-y: auto; }
+  .gauge .head { display: flex; align-items: baseline; }
+  .gauge .head .k { flex: 1; color: var(--ink2); font-size: 14px; }
+  .gauge .head .v { font-size: 24px; font-weight: bold; }
+  .gauge .head .u { color: var(--ink3); font-size: 12px; margin-left: 4px; }
+  .gauge .ends { display: flex; justify-content: space-between; color: var(--ink3); font-size: 10px; margin: 2px 0 8px; }
+  .wheels { display: flex; justify-content: center; align-items: stretch; gap: 14px; margin-top: 6px; }
+  .count { display: flex; flex-direction: column; justify-content: center; text-align: center; width: 64px; }
+  .count .k { color: var(--ink3); font-size: 10px; } .count .v { color: var(--ink2); font-size: 13px; }
+  .wheel { display: flex; flex-direction: column; align-items: center; width: 96px; }
+  .wheel .k { color: var(--ink2); font-size: 14px; }
+  .col { position: relative; width: 56px; height: 180px; background: var(--track); border-radius: 8px; overflow: hidden; margin: 6px 0; }
+  .col .fill { position: absolute; left: 0; right: 0; }
+  .col .strip { position: absolute; left: 40%; right: 40%; background: #ffffff99; }
+  .col .zero { position: absolute; left: 0; right: 0; top: 50%; height: 2px; background: var(--zero); }
+  .wheel .v { font-size: 20px; font-weight: bold; } .wheel .s { color: var(--ink3); font-size: 11px; }
+  #status { color: #707070; font-size: 11px; text-align: center; margin-top: 14px; white-space: pre-line; }
+</style>
+</head>
+<body>
+<header>
+  <button class="tab" data-view="drive">DRIVE</button>
+  <button class="tab" data-view="mirror">SCREEN</button>
+  <span id="link" title="connection to the robot"></span>
+</header>
+
+<main id="drive">
+  <div class="modes">
+    <button data-mode="manual">Balance when idle<br><span style="color:var(--ink3)">drive / test</span></button>
+    <button data-mode="auto">Random targets when idle<br><span style="color:var(--ink3)">training</span></button>
+  </div>
+  <div id="padwrap">
+    <div id="pad">
+      <div class="axis h"></div><div class="axis vt"></div>
+      <span class="cap" style="top:3%;left:50%;transform:translateX(-50%)">FORWARD</span>
+      <span class="cap" style="bottom:3%;left:50%;transform:translateX(-50%)">BACK</span>
+      <span class="cap" style="left:3%;top:50%;transform:translateY(-50%)">L</span>
+      <span class="cap" style="right:3%;top:50%;transform:translateY(-50%)">R</span>
+      <div id="knob"></div>
+      <div class="dot" id="actual"></div>
+      <div class="dot" id="target"></div>
+    </div>
+  </div>
+  <div class="legend"><span><i style="border:2px solid var(--yellow)"></i>target</span>
+    <span><i style="background:var(--blue)"></i>robot is doing</span></div>
+  <div class="row" style="margin-top:10px">
+    <div class="tile"><div class="k">source</div><div class="v" id="d-src">-</div></div>
+    <div class="tile"><div class="k">forward</div><div class="v" id="d-fwd">-</div><div class="sub" id="d-fwd2">&nbsp;</div></div>
+    <div class="tile"><div class="k">turn</div><div class="v" id="d-turn">-</div><div class="sub" id="d-turn2">&nbsp;</div></div>
+  </div>
+  <div class="row" style="margin-top:8px">
+    <div class="tile"><div class="k">reward</div><div class="v" id="d-rew">-</div></div>
+    <div class="tile"><div class="k">tilt</div><div class="v" id="d-tilt">-</div></div>
+    <div class="tile"><div class="k">loop</div><div class="v" id="d-hz">-</div></div>
+  </div>
+</main>
+
+<main id="mirror">
+  <div class="label">REWARD</div>
+  <div class="bar" style="height:56px" id="m-reward"><div class="fill"></div><div class="zero"></div><div class="text" style="font-size:22px"></div></div>
+  <div class="row" style="margin-top:8px">
+    <div class="tile"><div class="k">episode mean</div><div class="v" id="m-epmean">-</div></div>
+    <div class="tile"><div class="k">last episode</div><div class="v" id="m-lastep">-</div></div>
+  </div>
+  <div style="height:14px"></div>
+  <div class="gauge" id="m-angle"></div>
+  <div class="gauge" id="m-rate"></div>
+  <div class="label">COMMAND</div>
+  <div class="row">
+    <div class="tile"><div class="k">source</div><div class="v" id="m-src">-</div></div>
+    <div class="tile"><div class="k">forward</div><div class="v" id="m-fwd">-</div><div class="sub" id="m-fwd2">&nbsp;</div></div>
+    <div class="tile"><div class="k">turn</div><div class="v" id="m-turn">-</div><div class="sub" id="m-turn2">&nbsp;</div></div>
+  </div>
+  <div class="wheels">
+    <div class="count"><div class="k">count</div><div class="v" id="m-countl">-</div></div>
+    <div class="wheel" id="m-wl"></div>
+    <div class="wheel" id="m-wr"></div>
+    <div class="count"><div class="k">count</div><div class="v" id="m-countr">-</div></div>
+  </div>
+  <div class="row" style="margin-top:14px">
+    <div class="tile"><div class="k">loop</div><div class="v" id="m-hz">-</div></div>
+    <div class="tile"><div class="k">step</div><div class="v" id="m-step">-</div></div>
+  </div>
+  <div class="row" style="margin-top:8px">
+    <div class="tile"><div class="k">battery</div><div class="v" id="m-bat">-</div></div>
+    <div class="tile"><div class="k">charger</div><div class="v" id="m-chg">-</div></div>
+    <div class="tile"><div class="k">coil</div><div class="v" id="m-coil">-</div></div>
+  </div>
+  <div id="status"></div>
+</main>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const fmt = (v, d = 2) => (v == null || isNaN(v)) ? "-" : (v >= 0 ? "+" : "") + Number(v).toFixed(d);
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+// --- views ---------------------------------------------------------------
+function show(view) {
+  document.querySelectorAll("main").forEach(m => m.classList.toggle("on", m.id === view));
+  document.querySelectorAll(".tab").forEach(t => t.classList.toggle("on", t.dataset.view === view));
+  history.replaceState(null, "", view === "mirror" ? "/mirror" : "/");
+}
+document.querySelectorAll(".tab").forEach(t => t.onclick = () => show(t.dataset.view));
+show(location.pathname.startsWith("/mirror") ? "mirror" : "drive");
+
+// --- joystick ------------------------------------------------------------
+// Up is forward, right is turn right. The stick posts every 80 ms while held
+// (the robot lets go 0.5 s after the last post) and releases on lift.
+const pad = $("pad"), knob = $("knob");
+let stick = null, inflight = false, timer = null;
+
+function place(el, f, t) {   // f, t in [-1, 1] -> position in the pad
+  el.style.left = (50 + 40 * t) + "%";
+  el.style.top = (50 - 40 * f) + "%";
+}
+function post(path, body) {
+  return fetch(path, { method: "POST", headers: { "Content-Type": "application/json" },
+                       body: JSON.stringify(body) });
+}
+function send() {
+  if (!stick || inflight) return;
+  inflight = true;
+  post("/cmd", stick).catch(() => {}).finally(() => inflight = false);
+}
+function fromEvent(e) {
+  const r = pad.getBoundingClientRect();
+  let x = (e.clientX - r.left) / r.width * 2 - 1, y = -((e.clientY - r.top) / r.height * 2 - 1);
+  x /= 0.8; y /= 0.8;   // the outer ring is full deflection
+  const n = Math.hypot(x, y);
+  if (n > 1) { x /= n; y /= n; }
+  // A small dead zone, so a resting thumb means "balance".
+  const dz = 0.08;
+  const shape = v => Math.abs(v) < dz ? 0 : Math.sign(v) * (Math.abs(v) - dz) / (1 - dz);
+  return { forward: +shape(y).toFixed(3), turn: +shape(x).toFixed(3) };
+}
+pad.addEventListener("pointerdown", e => {
+  pad.setPointerCapture(e.pointerId);
+  pad.classList.add("held");
+  stick = fromEvent(e); place(knob, stick.forward, stick.turn); send();
+  clearInterval(timer); timer = setInterval(send, 80);
+});
+pad.addEventListener("pointermove", e => {
+  if (!stick) return;
+  stick = fromEvent(e); place(knob, stick.forward, stick.turn);
+});
+function lift() {
+  if (!stick) return;
+  stick = null; clearInterval(timer);
+  pad.classList.remove("held"); place(knob, 0, 0);
+  post("/cmd", { release: true }).catch(() => {});
+}
+pad.addEventListener("pointerup", lift);
+pad.addEventListener("pointercancel", lift);
+document.addEventListener("visibilitychange", () => document.hidden && lift());
+
+document.querySelectorAll("[data-mode]").forEach(b =>
+  b.onclick = () => post("/mode", { mode: b.dataset.mode }).then(poll));
+
+// --- mirror widgets ------------------------------------------------------
+function setBar(el, v, lo, hi, color) {
+  const pos = x => (clamp((x - lo) / (hi - lo), 0, 1) * 100);
+  const z = pos(clamp(0, lo, hi)), p = pos(v);
+  const fill = el.querySelector(".fill");
+  fill.style.left = Math.min(z, p) + "%"; fill.style.width = Math.abs(p - z) + "%";
+  fill.style.background = color || (v >= 0 ? "var(--blue)" : "var(--red)");
+  el.querySelector(".zero").style.left = "calc(" + z + "% - 1px)";
+}
+function gauge(id, name, unit, lo, hi, digits) {
+  const el = $(id);
+  el.innerHTML = `<div class="head"><span class="k">${name}</span><span class="v"></span><span class="u">${unit}</span></div>
+    <div class="bar"><div class="fill"></div><div class="zero"></div></div>
+    <div class="ends"><span></span><span></span></div>`;
+  const g = { lo, hi };
+  g.update = v => {
+    // Widen for anything beyond the normal range, as the phone's bars do.
+    g.lo = Math.min(g.lo, v); g.hi = Math.max(g.hi, v);
+    el.querySelector(".v").textContent = fmt(v, digits);
+    setBar(el.querySelector(".bar"), v, g.lo, g.hi);
+    const ends = el.querySelectorAll(".ends span");
+    ends[0].textContent = fmt(g.lo, 0); ends[1].textContent = fmt(g.hi, 0);
+  };
+  return g;
+}
+function wheel(id, name) {
+  const el = $(id);
+  el.innerHTML = `<div class="k">${name}</div><div class="col"><div class="fill"></div><div class="strip"></div><div class="zero"></div></div>
+    <div class="v">-</div><div class="s">-</div>`;
+  let span = 1;
+  return (cmd, speed) => {
+    span = Math.max(span * 0.995, Math.abs(speed) * 1.1, 1);
+    const fill = el.querySelector(".fill"), strip = el.querySelector(".strip");
+    const c = clamp(cmd, -1, 1), s = clamp(speed / span, -1, 1);
+    fill.style.top = (c >= 0 ? 50 - 50 * c : 50) + "%"; fill.style.height = Math.abs(50 * c) + "%";
+    fill.style.background = c >= 0 ? "var(--blue)" : "var(--red)";
+    strip.style.top = (s >= 0 ? 50 - 50 * s : 50) + "%"; strip.style.height = Math.abs(50 * s) + "%";
+    el.querySelector(".v").textContent = fmt(cmd);
+    el.querySelector(".s").textContent = "speed " + fmt(speed, 0);
+  };
+}
+const angle = gauge("m-angle", "angle", "deg", -10, 12, 2);
+const rate = gauge("m-rate", "angular velocity", "deg/s", -200, 200, 1);
+const wl = wheel("m-wl", "left"), wr = wheel("m-wr", "right");
+
+// --- state ---------------------------------------------------------------
+const SRC = { joystick: "joystick", auto: "random", idle: "balance" };
+function render(s) {
+  const cmd = s.cmd || [0, 0], meas = s.measured;
+  // drive view
+  if (!stick) place(knob, 0, 0);
+  place($("target"), cmd[0], cmd[1]);
+  $("actual").style.display = meas ? "" : "none";
+  if (meas) place($("actual"), clamp(meas[0], -1.2, 1.2), clamp(meas[1], -1.2, 1.2));
+  const src = SRC[s.cmd_src] || "-";
+  $("d-src").textContent = $("m-src").textContent = src;
+  // Target large, what the wheels are doing beneath it.
+  const doing = m => m == null ? "\u00a0" : "doing " + fmt(m);
+  $("d-fwd").textContent = $("m-fwd").textContent = fmt(cmd[0]);
+  $("d-turn").textContent = $("m-turn").textContent = fmt(cmd[1]);
+  $("d-fwd2").textContent = $("m-fwd2").textContent = doing(meas && meas[0]);
+  $("d-turn2").textContent = $("m-turn2").textContent = doing(meas && meas[1]);
+  $("d-rew").textContent = fmt(s.reward_avg);
+  $("d-tilt").textContent = fmt(s.theta_deg, 1) + "°";
+  $("d-hz").textContent = (s.hz || 0).toFixed(1) + " Hz";
+  document.querySelectorAll("[data-mode]").forEach(b => b.classList.toggle("on", b.dataset.mode === s.mode));
+  // mirror view
+  const ra = s.reward_avg || 0;
+  const rc = ra >= 0.7 ? "var(--blue)" : ra >= 0.3 ? "var(--yellow)" : "var(--red)";
+  setBar($("m-reward"), ra, -0.5, 1.0, rc);
+  $("m-reward").querySelector(".text").textContent = fmt(ra);
+  $("m-epmean").textContent = fmt(s.ep_mean, 3) + "  (" + fmt(s.ep_return, 0) + ")";
+  $("m-lastep").textContent = s.last_ep_mean == null ? "-" : fmt(s.last_ep_mean, 3) + "  (" + fmt(s.last_ep_return, 0) + ")";
+  angle.update(s.theta_deg || 0); rate.update(s.rate_deg || 0);
+  wl(s.act_l || 0, s.speed_l || 0); wr(s.act_r || 0, s.speed_r || 0);
+  $("m-countl").textContent = s.count_l ?? "-"; $("m-countr").textContent = s.count_r ?? "-";
+  $("m-hz").textContent = (s.hz || 0).toFixed(1) + " Hz";
+  $("m-step").textContent = s.step ?? "-";
+  $("m-bat").textContent = (s.battery || 0).toFixed(2) + " V";
+  $("m-chg").textContent = (s.charger || 0).toFixed(2) + " V";
+  $("m-coil").textContent = (s.coil || 0).toFixed(2) + " V";
+  $("status").textContent = (s.status || "") + "\n" + (s.serial ? "serial " + s.serial : "serial ok");
+}
+let polling = false;
+async function poll() {
+  if (polling) return;
+  polling = true;
+  try {
+    const r = await fetch("/state", { cache: "no-store" });
+    render(await r.json());
+    $("link").classList.add("ok");
+  } catch (e) {
+    $("link").classList.remove("ok");
+  } finally { polling = false; }
+}
+setInterval(poll, 100);
+poll();
+</script>
+</body>
+</html>

@@ -109,11 +109,13 @@ class PolicyRunner:
     self.is_first = True
     self._pre = None
 
-  def observe(self, sensors):
+  def observe(self, sensors, command=None):
     """Sensor dict -> the observation the network expects.
 
     Mirrors `robot.py:_obs`. Kept as its own method so the same scaling can be
-    checked against the trainer's without running the network.
+    checked against the trainer's without running the network. `command` is
+    (forward, turn) in [-1, 1], used only by a policy trained on the command
+    task (its manifest lists a 'command' key); None is a centred stick.
     """
     s = self.policy.meta['obs_scale']
     theta = float(sensors['theta'])
@@ -125,7 +127,11 @@ class PolicyRunner:
     wheels = np.clip(np.array([
         float(sensors['wheel_speed_l']), float(sensors['wheel_speed_r']),
     ], np.float32) * s['obs_wheel_scale'], -clip, clip)
-    return {'orientation': orientation, 'wheels': wheels}
+    obs = {'orientation': orientation, 'wheels': wheels}
+    if 'command' in self.policy.meta['obs_keys']:
+      obs['command'] = np.clip(np.asarray(
+          command if command is not None else (0.0, 0.0), np.float32), -1, 1)
+    return obs
 
   def prepare(self):
     """Run the observation-independent half of the next step now.
@@ -142,7 +148,7 @@ class PolicyRunner:
                  self.policy.precompute(self.carry, self.is_first))
     self.last_prepare_ms = (time.monotonic() - t0) * 1e3
 
-  def act(self, sensors):
+  def act(self, sensors, command=None):
     """One policy step. Returns (obs, action) with action as a 2-list.
 
     The observation is returned too because the trainer needs exactly the one
@@ -151,7 +157,7 @@ class PolicyRunner:
     either side's scaling changes.
     """
     t0 = time.monotonic()
-    obs = self.observe(sensors)
+    obs = self.observe(sensors, command)
     self.was_first = self.is_first
     pre = self._pre
     self._pre = None

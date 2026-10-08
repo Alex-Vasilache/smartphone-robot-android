@@ -65,6 +65,21 @@ class GuiUpdater(
     /** Free-text note on the wheels, e.g. "stopped". */
     @Volatile var lastAction: String = ""
 
+    /** The command the policy follows (forward, turn in [-1, 1]), where it
+     *  came from (joystick, auto, idle), and the web page's address. */
+    @Volatile var commandForward: Double = 0.0
+    @Volatile var commandTurn: Double = 0.0
+    @Volatile var commandSource: String = "idle"
+    @Volatile var webUrl: String = ""
+
+    /** One call from Python per refresh, rather than four. */
+    fun setCommand(forward: Double, turn: Double, source: String, url: String) {
+        commandForward = forward
+        commandTurn = turn
+        commandSource = source
+        webUrl = url
+    }
+
     private fun dp(v: Int) = (v * activity.resources.displayMetrics.density).toInt()
 
     private fun text(s: String, color: Int, size: Float, bold: Boolean = false) =
@@ -216,11 +231,14 @@ class GuiUpdater(
 
         spacer(); spacer()
         // Two groups, one row each: how the control loop is running, and power.
-        val control = hstack().apply { setPadding(dp(64), 0, dp(64), 0) }
+        val control = hstack().apply { setPadding(dp(32), 0, dp(32), 0) }
         tile(control, "loop", BarView(activity, 0.0, 50.0, signed = false)) {
             Pair(String.format(Locale.US, "%.1f Hz", controlHz), controlHz)
         }
         tile(control, "step", null) { Pair(String.format(Locale.US, "%d", step), 0.0) }
+        tile(control, "command", null) {
+            Pair(String.format(Locale.US, "%+.1f %+.1f", commandForward, commandTurn), 0.0)
+        }
         binding.rows.addView(control)
         val power = hstack().apply { setPadding(dp(32), dp(10), dp(32), dp(12)) }
         tile(power, "battery", BarView(activity, 3.0, 4.3, signed = false)) {
@@ -246,9 +264,10 @@ class GuiUpdater(
             // Always the same lines, so a longer status never moves the layout.
             val trainer = trainerStatus.substringBefore(" (")
                 .replace("connected to ", "trainer ").replace("policy ", "policy …")
-            binding.status.text = String.format(Locale.US, "%s\n%s", trainer.take(34),
+            binding.status.text = String.format(Locale.US, "%s\n%s\n%s", trainer.take(34),
                 if (serialNote.isEmpty()) "serial ok" else "serial " + serialNote
-                    .replace(" missed replies, last ", " missed, last "))
+                    .replace(" missed replies, last ", " missed, last "),
+                if (webUrl.isEmpty()) "" else "$commandSource  " + webUrl.removePrefix("http://"))
         }
     }
 }

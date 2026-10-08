@@ -57,6 +57,8 @@ from jp.oist.abcvlib.util import (
 from jp.oist.abcvlib.dreamerBridge import SensorSnapshot
 
 import bridge_link
+from command import CommandSource
+import webui
 
 PROTOCOL = 3
 CONTROL_HZ = 50.0
@@ -271,6 +273,17 @@ serial_ok = True          # the RP2040 answered within SERIAL_WAIT_MAX_MS
 serial_misses = 0         # waits that hit SERIAL_WAIT_MAX_MS, for the display
 last_serial_warning = 0.0
 last_stale_warning = 0.0
+# The command a command-task policy follows (command.py), and the web page
+# that steers it and mirrors this screen (webui.py).
+commands = CommandSource()
+web = None
+web_url = ''
+# Wheel speeds that command 1.0 means, from the trainer's settings; only for
+# showing what the robot is doing next to what it is asked. None: unknown.
+command_units = None
+last_reward = 0.0
+last_ep_mean = None
+last_ep_return = None
 
 
 # The sensor subscribers live in Kotlin (SensorSnapshot.kt). They used to be
@@ -295,6 +308,9 @@ def setup():
             os.sched_setaffinity(0, set(PIN_CPUS))
         except Exception as e:  # noqa: BLE001
             print('dreamerBridge: could not pin the control thread: %s' % e)
+    global web, web_url
+    web = webui.WebUI(commands)
+    web_url = web.start() or ''
     from policy_runner import PolicyRunner
     if player_policy:
         setup_player(PolicyRunner)
@@ -371,13 +387,25 @@ def setup_player(PolicyRunner):
     onboard = True
     max_hz = float(player['hz'])
     cmd_scale = float(player.get('command_scale', 1.0))
+    # Nobody needs random targets on a finished policy: it balances until the
+    # joystick says otherwise.
+    commands.set_mode('manual')
+    note_command_units(player)
     pace = PACE
     print('dreamerBridge: player running %s at %g Hz (%s actions)' % (
         player['name'], max_hz, runner.mode))
 
 
-def player_reward(sensors, act):
-    """The training reward (embodied/envs/robot.py, task balance), for display."""
+def note_command_units(settings):
+    global command_units
+    if settings and settings.get('command_speed') and settings.get('command_turn'):
+        command_units = (float(settings['command_speed']),
+                         float(settings['command_turn']))
+
+
+def player_reward(sensors, act, cmd):
+    """The training reward (embodied/envs/robot.py, tasks balance and
+    command), for display."""
     global prev_act
     p = player
     if 'theta_zero' not in p:
@@ -386,10 +414,25 @@ def player_reward(sensors, act):
     reach = p['theta_hi'] if offset > 0 else abs(p['theta_lo'])
     linear = 1.0 - min(1.0, abs(offset) / max(reach, 1e-6))
     bonus = math.exp(-(offset / p['theta_sigma']) ** 2)
-    left = float(sensors['wheel_speed_l']) * p['speed_scale']
-    right = float(sensors['wheel_speed_r']) * p['speed_scale']
+    left = float(sensors['wheel_speed_l'])
+    right = float(sensors['wheel_speed_r'])
+    balance, track = 0.5 * linear + 0.5 * bonus, 0.0
+    if p.get('task') == 'command' and command_units:
+        # _command_reward: penalties measured from the commanded wheel speeds.
+        speed, turn = command_units
+        sigma = float(p.get('command_sigma', 0.3))
+        forward = 0.5 * (left + right) / speed
+        spin = 0.5 * (left - right) / turn
+        track = 0.5 * (math.exp(-((forward - cmd[0]) / sigma) ** 2)
+                       + math.exp(-((spin - cmd[1]) / sigma) ** 2))
+        balance *= 0.5
+        left -= cmd[0] * speed + cmd[1] * turn
+        right -= cmd[0] * speed - cmd[1] * turn
+        track *= 0.5
+    left *= p['speed_scale']
+    right *= p['speed_scale']
     clip = p['drift_clip']
-    reward = (0.5 * linear + 0.5 * bonus
+    reward = (balance + track
               - p['rate_penalty'] * abs(float(sensors['angular_velocity']))
               - p['drift_penalty'] * min(abs(0.5 * (left + right)), clip)
               - p['wheel_penalty'] * 0.5 * (min(abs(left), clip)
@@ -406,9 +449,10 @@ def loop_player():
     global step, prev_act
     wait_for_pace()
     snap, _, _ = sample()
-    _, act = runner.act(snap)
+    cmd = commands.tick()
+    _, act = runner.act(snap, cmd)
     drive(act[0], act[1])
-    note_reward(player_reward(snap, act))
+    note_reward(player_reward(snap, act, cmd))
     step += 1
     if step >= int(player['length']):
         # Episodes as long as in training: the policy never saw a longer
@@ -487,7 +531,7 @@ def loop():
             # ticks; experience collected now is simply not recorded.
             wait_for_pace()
             snap, _, _ = sample()
-            _, act = runner.act(snap)
+            _, act = runner.act(snap, commands.tick())
             drive(act[0], act[1])
             if prepare_ahead:
                 runner.prepare()
@@ -501,6 +545,7 @@ def loop():
         # Connection attempts stay on their own slower cadence.
         stop_wheels()
         sample()
+        commands.tick()  # nothing follows it yet, but the page shows it
         update_gui()
         if time.monotonic() - last_attempt >= RETRY_DELAY:
             connect()
@@ -564,7 +609,9 @@ def loop():
         wait_for_tick()
         before_write = time.monotonic()
         snap, snap_stamp, snap_age = sample()
+        cmd = commands.tick()
         write(dict(type='obs', step=step, t=time.time(),
+                   cmd=cmd, cmd_src=commands.source,
                    # True when this tick applied a new action rather than
                    # repeating the previous one.
                    fresh=act is not None,
@@ -590,7 +637,8 @@ def note_reward(reward):
     One step's reward jumps around at 25 Hz and the screen refreshes at 10, so
     the headline number is an exponential average over ~0.5 s of steps.
     """
-    global reward_avg, ep_return, ep_steps
+    global reward_avg, ep_return, ep_steps, last_reward
+    last_reward = reward
     reward_avg += REWARD_AVG_ALPHA * (reward - reward_avg)
     ep_return += reward
     ep_steps += 1
@@ -602,8 +650,9 @@ def note_reward(reward):
 
 
 def end_episode():
-    global ep_return, ep_steps
+    global ep_return, ep_steps, last_ep_mean, last_ep_return
     if ep_steps:
+        last_ep_mean, last_ep_return = ep_return / ep_steps, ep_return
         context.guiUpdater.setLastEpisodeReturn(ep_return)
         context.guiUpdater.setLastEpisodeMean(ep_return / ep_steps)
     ep_return = 0.0
@@ -643,7 +692,40 @@ def update_gui():
     gui.setLastAction('')
     gui.setStep(int(step))
     gui.setControlHz(control_hz)
+    gui.setCommand(float(commands.current[0]), float(commands.current[1]),
+                   commands.source, web_url)
     gui.displayValues()
+    if web is not None:
+        web.state = web_state(gui)
+
+
+def web_state(gui):
+    """What the web page's mirror shows: this screen's numbers, as JSON."""
+    measured = None
+    if command_units:
+        left = float(sensors['wheel_speed_l'])
+        right = float(sensors['wheel_speed_r'])
+        measured = [0.5 * (left + right) / command_units[0],
+                    0.5 * (left - right) / command_units[1]]
+    return dict(
+        reward=last_reward, reward_avg=reward_avg,
+        ep_mean=(ep_return / ep_steps) if ep_steps else 0.0,
+        ep_return=ep_return, last_ep_mean=last_ep_mean,
+        last_ep_return=last_ep_return,
+        theta_deg=math.degrees(sensors['theta']),
+        rate_deg=math.degrees(sensors['angular_velocity']),
+        speed_l=float(sensors['wheel_speed_l']),
+        speed_r=float(sensors['wheel_speed_r']),
+        count_l=int(sensors['wheel_count_l']),
+        count_r=int(sensors['wheel_count_r']),
+        act_l=float(last_command[0]), act_r=float(last_command[1]),
+        step=int(step), hz=control_hz,
+        battery=float(sensors['battery_voltage']),
+        charger=float(sensors['charger_voltage']),
+        coil=float(sensors['coil_voltage']),
+        status=str(gui.getTrainerStatus()), serial=str(gui.getSerialNote()),
+        cmd=list(commands.current), cmd_src=commands.source,
+        mode=commands.settings['mode'], measured=measured)
 
 
 def loop_onboard():
@@ -671,13 +753,15 @@ def loop_onboard():
             time.sleep(0.0005)
         tick = time.monotonic()
         snap, snap_stamp, snap_age = sample()
-        obs, act = runner.act(snap)
+        cmd = commands.tick()
+        obs, act = runner.act(snap, cmd)
         wait_for_serial()
     else:
         wait_for_pace()
         tick = time.monotonic()
         snap, snap_stamp, snap_age = sample()
-        obs, act = runner.act(snap)
+        cmd = commands.tick()
+        obs, act = runner.act(snap, cmd)
     drive(act[0], act[1])
     applied = time.monotonic()
     last_act = applied
@@ -690,6 +774,9 @@ def loop_onboard():
                # than one of its own: what the world model learns must be what
                # the wheels actually did.
                act=act,
+               # The command the policy just followed; the trainer scores
+               # the step against it and records it as an observation.
+               cmd=cmd, cmd_src=commands.source,
                is_first=runner.was_first,
                # Same split as the legacy path, but here work_ms is the real
                # decision cost, not a sleep: it is sample -> policy -> wheels.
@@ -746,8 +833,9 @@ def loop_trainer_serial():
     tick = time.monotonic()
     snap, snap_stamp, snap_age = sample()
     seq += 1
+    cmd = commands.tick()
     write(dict(type='obs', step=step, seq=seq, t=time.time(), fresh=True,
-               pace=pace, cycle_ms=cycle_ms,
+               pace=pace, cycle_ms=cycle_ms, cmd=cmd, cmd_src=commands.source,
                serial_wait_ms=serial_wait_ms,
                wait_ms=last_wait_ms, work_ms=last_work_ms,
                drive_ms=drive_ms, sensors=snap,
@@ -1152,6 +1240,10 @@ def connect():
         pace = hello.get('pace', PACE)
         global cmd_scale
         cmd_scale = float(hello.get('cmd_scale', 1.0))
+        # A command-task trainer says how to pick commands nobody steers.
+        if hello.get('command'):
+            commands.configure(hello['command'])
+        note_command_units(hello.get('settings'))
         max_hz = float(hello.get('max_hz', settings['max_hz']))
         if pace not in ('serial', 'clock'):
             raise ValueError('Unknown pacing %r' % pace)
