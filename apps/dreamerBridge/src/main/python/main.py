@@ -430,10 +430,14 @@ def player_reward(sensors, act, cmd):
         spin = 0.5 * (left - right) / turn
         track = 0.5 * (math.exp(-((forward - cmd[0]) / sigma) ** 2)
                        + math.exp(-((spin - cmd[1]) / sigma) ** 2))
-        balance *= 0.5
         left -= cmd[0] * speed + cmd[1] * turn
         right -= cmd[0] * speed - cmd[1] * turn
-        track *= 0.5
+        # 'sum' (e1299 and older sidecars, which carry no command_reward)
+        # is half and half; 'product' pays balance times tracking.
+        if p.get('command_reward', 'sum') == 'product':
+            balance, track = balance * track, 0.0
+        else:
+            balance, track = 0.5 * balance, 0.5 * track
     left *= p['speed_scale']
     right *= p['speed_scale']
     clip = p['drift_clip']
