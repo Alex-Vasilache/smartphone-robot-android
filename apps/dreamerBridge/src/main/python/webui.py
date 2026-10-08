@@ -79,7 +79,10 @@ def ws_read(rfile):
     data = rfile.read(n)
     if len(data) < n:
         return None
-    return opcode, bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+    # Unmask as one big integer XOR rather than byte by byte in Python: the
+    # reader thread holds the GIL for less time with the control loop waiting.
+    key = int.from_bytes((mask * (n // 4 + 1))[:n], 'little')
+    return opcode, (int.from_bytes(data, 'little') ^ key).to_bytes(n, 'little')
 
 
 class _Client:

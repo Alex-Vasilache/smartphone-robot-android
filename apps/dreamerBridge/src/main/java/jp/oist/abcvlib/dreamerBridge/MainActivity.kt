@@ -107,8 +107,15 @@ open class MainActivity : AbcvlibActivity(), SerialReadyListener {
     }
 
     private fun initPython() {
-        if (!Python.isStarted()) {
-            Python.start(AndroidPlatform(this))
+        // With no_base set while a base is plugged in, the no-base start in
+        // onCreate and onSerialReady (on a coroutine) both get here at once,
+        // and two racing Python.start calls crashed the app with "Python
+        // already started" (2026-10-08). A second run() is fine: abcvlib.py
+        // keeps the one control loop and only restarts the serial side.
+        synchronized(MainActivity::class.java) {
+            if (!Python.isStarted()) {
+                Python.start(AndroidPlatform(this))
+            }
         }
 
         val py = Python.getInstance()

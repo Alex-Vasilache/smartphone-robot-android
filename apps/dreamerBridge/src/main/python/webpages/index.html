@@ -215,10 +215,15 @@ function send() {
   inflight = true;
   post("/cmd", stick).catch(() => {}).finally(() => inflight = false);
 }
+// The robot reads the stick once per control step (25 Hz), so sending faster
+// only costs its CPU: measured on the robot, 30 messages/s raised the policy's
+// p99 sample->wheels from 8.5 to 11.3 ms. At most one send per 40 ms.
+let lastSend = 0;
 function sendSoon() {
   if (queued) return;
   queued = true;
-  requestAnimationFrame(() => { queued = false; send(); });
+  setTimeout(() => { queued = false; lastSend = performance.now(); send(); },
+             Math.max(0, 40 - (performance.now() - lastSend)));
 }
 function fromEvent(e) {
   const r = pad.getBoundingClientRect();
