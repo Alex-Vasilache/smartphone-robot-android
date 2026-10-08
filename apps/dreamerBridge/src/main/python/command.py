@@ -16,7 +16,8 @@ Where it comes from, in order:
     training runs on; nobody can steer for an hour.
   - 'manual': zero, which is "balance in place".
 
-The trainer's handshake sets the sampler (`command` in its hello), the web
+Training starts in 'auto', the trainer's handshake sets the sampler
+(`command` in its hello, which also resets the mode to the run's), the web
 page can switch the mode at any time, and the player starts in 'manual'.
 """
 
@@ -28,7 +29,11 @@ import time
 # drops off the WiFi mid-drive cannot leave the robot driving.
 JOYSTICK_HOLD = 0.5
 
-DEFAULTS = dict(mode='manual', hold_min=2.0, hold_max=5.0, p_zero=0.3,
+# 'auto' from the start: the app trains by default, and a policy that does not
+# read commands ignores them. Starting in 'manual' left the page showing
+# "Balance when idle" after every app restart until a trainer connected.
+# The player switches to 'manual' itself.
+DEFAULTS = dict(mode='auto', hold_min=2.0, hold_max=5.0, p_zero=0.3,
                 p_axis=0.4)
 
 
