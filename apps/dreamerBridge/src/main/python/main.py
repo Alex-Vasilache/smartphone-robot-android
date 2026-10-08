@@ -402,10 +402,14 @@ def setup_player(PolicyRunner):
 
 
 def note_command_units(settings):
+    """Wheel speeds per command unit, signed: forward_sign -1 means forward
+    is the robot's negative wheel direction (robot.py)."""
     global command_units
     if settings and settings.get('command_speed') and settings.get('command_turn'):
-        command_units = (float(settings['command_speed']),
-                         float(settings['command_turn']))
+        command_units = (
+            float(settings['command_speed'])
+            * float(settings.get('forward_sign', 1.0)),
+            float(settings['command_turn']))
 
 
 def player_reward(sensors, act, cmd):

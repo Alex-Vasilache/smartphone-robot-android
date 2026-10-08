@@ -12,8 +12,10 @@ Where it comes from, in order:
   each move posts a command and it holds for JOYSTICK_HOLD seconds;
 * otherwise, by mode:
   - 'auto': a random command, held for hold_min..hold_max seconds. Zero with
-    p_zero, one axis only with p_axis, both axes otherwise. This is what
-    training runs on; nobody can steer for an hour.
+    p_zero, one axis only with p_axis (forward or turn, evenly), both axes
+    otherwise. Each nonzero axis is a multiple of `step` (0.5: -1, -0.5,
+    0.5, 1) or, with step 0, anywhere in [-1, 1]. This is what training runs
+    on; nobody can steer for an hour.
   - 'manual': zero, which is "balance in place".
 
 Training starts in 'auto', the trainer's handshake sets the sampler
@@ -34,7 +36,7 @@ JOYSTICK_HOLD = 0.5
 # "Balance when idle" after every app restart until a trainer connected.
 # The player switches to 'manual' itself.
 DEFAULTS = dict(mode='auto', hold_min=2.0, hold_max=5.0, p_zero=0.3,
-                p_axis=0.4)
+                p_axis=0.4, step=0.0)
 
 
 class CommandSource:
@@ -95,13 +97,22 @@ class CommandSource:
         self.current, self.source = cmd, src
         return [cmd[0], cmd[1]]
 
+    def _value(self):
+        """One nonzero axis value."""
+        step = float(self.settings.get('step') or 0.0)
+        if step <= 0:
+            return self._rng.uniform(-1.0, 1.0)
+        levels = max(1, int(round(1.0 / step)))
+        return self._rng.choice((-1.0, 1.0)) * min(
+            1.0, step * self._rng.randint(1, levels))
+
     def _sample(self):
-        s, u = self.settings, self._rng.uniform
+        s = self.settings
         r = self._rng.random()
         if r < float(s['p_zero']):
             return (0.0, 0.0)
         if r < float(s['p_zero']) + float(s['p_axis']):
             if self._rng.random() < 0.5:
-                return (u(-1.0, 1.0), 0.0)
-            return (0.0, u(-1.0, 1.0))
-        return (u(-1.0, 1.0), u(-1.0, 1.0))
+                return (self._value(), 0.0)
+            return (0.0, self._value())
+        return (self._value(), self._value())
