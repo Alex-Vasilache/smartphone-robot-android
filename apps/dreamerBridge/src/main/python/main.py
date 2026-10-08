@@ -66,6 +66,9 @@ CONTROL_HZ = 50.0
 # with the control loop. Above ~10 Hz the runOnUiThread hop starts costing
 # more than the control step itself and shows up as jitter at the trainer.
 GUI_PERIOD = 0.1
+# The web page (webui.py) gets its own, faster refresh: it is pushed over a
+# socket on another thread, so it costs the loop only building a small dict.
+WEB_PERIOD = 0.04
 RECV_TIMEOUT = 30.0
 # Connecting must fail fast. The control loop is single threaded, so a blocking
 # connect freezes sensing and the display with it -- which looks exactly like a
@@ -282,6 +285,8 @@ web_url = ''
 # showing what the robot is doing next to what it is asked. None: unknown.
 command_units = None
 last_reward = 0.0
+last_web = 0.0
+web_status = ('', '')  # trainer status and serial note, as of the last GUI refresh
 last_ep_mean = None
 last_ep_return = None
 
@@ -674,6 +679,10 @@ def update_gui():
         last_report = now
     else:
         last_report = now
+    global last_web
+    if web is not None and now - last_web >= WEB_PERIOD:
+        last_web = now
+        web.publish(web_state())
     if now - last_gui < GUI_PERIOD:
         return
     last_gui = now
@@ -695,11 +704,11 @@ def update_gui():
     gui.setCommand(float(commands.current[0]), float(commands.current[1]),
                    commands.source, web_url)
     gui.displayValues()
-    if web is not None:
-        web.state = web_state(gui)
+    global web_status
+    web_status = (str(gui.getTrainerStatus()), str(gui.getSerialNote()))
 
 
-def web_state(gui):
+def web_state():
     """What the web page's mirror shows: this screen's numbers, as JSON."""
     measured = None
     if command_units:
@@ -723,7 +732,7 @@ def web_state(gui):
         battery=float(sensors['battery_voltage']),
         charger=float(sensors['charger_voltage']),
         coil=float(sensors['coil_voltage']),
-        status=str(gui.getTrainerStatus()), serial=str(gui.getSerialNote()),
+        status=web_status[0], serial=web_status[1],
         cmd=list(commands.current), cmd_src=commands.source,
         mode=commands.settings['mode'], measured=measured)
 

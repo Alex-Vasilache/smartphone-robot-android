@@ -13,7 +13,7 @@
     --mono: ui-monospace, "SF Mono", Menlo, "Roboto Mono", monospace;
   }
   * { box-sizing: border-box; }
-  html, body { margin: 0; height: 100%; background: var(--surface); color: var(--ink);
+  html, body { margin: 0; height: 100%; height: 100dvh; overflow: hidden; background: var(--surface); color: var(--ink);
     font-family: var(--mono); -webkit-tap-highlight-color: transparent; }
   body { display: flex; flex-direction: column; overscroll-behavior: none; }
   header { display: flex; align-items: center; gap: 8px; padding: 10px 16px 6px; }
@@ -61,24 +61,31 @@
   .legend { display: flex; justify-content: center; gap: 16px; color: var(--ink3); font-size: 11px; }
   .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 5px; vertical-align: -1px; }
 
-  /* mirror */
-  #mirror { overflow-y: auto; }
+  /* mirror: fits one screen; the wheel columns take whatever height is left */
+  #mirror { padding-top: 0; padding-bottom: 10px; }
+  #mirror .label { margin: 6px 0 4px; }
+  #mirror .tile { padding: 5px 4px; }
+  #mirror .tile .v { font-size: 14px; }
+  #mirror .tile .sub { font-size: 10px; margin-top: 0; }
+  #mirror .tight .tile .v { font-size: 13px; }
+  #mirror main > .wheels, #mirror .wheels { flex: 1 1 0; min-height: 0; flex-shrink: 1; }
   .gauge .head { display: flex; align-items: baseline; }
   .gauge .head .k { flex: 1; color: var(--ink2); font-size: 14px; }
-  .gauge .head .v { font-size: 24px; font-weight: bold; }
+  .gauge .head .v { font-size: 20px; font-weight: bold; }
   .gauge .head .u { color: var(--ink3); font-size: 12px; margin-left: 4px; }
-  .gauge .ends { display: flex; justify-content: space-between; color: var(--ink3); font-size: 10px; margin: 2px 0 8px; }
-  .wheels { display: flex; justify-content: center; align-items: stretch; gap: 14px; margin-top: 6px; }
+  .gauge .bar { height: 16px; }
+  .gauge .ends { display: flex; justify-content: space-between; color: var(--ink3); font-size: 10px; margin: 1px 0 4px; }
+  .wheels { display: flex; justify-content: center; align-items: stretch; gap: 14px; margin-top: 4px; }
   .count { display: flex; flex-direction: column; justify-content: center; text-align: center; width: 64px; }
   .count .k { color: var(--ink3); font-size: 10px; } .count .v { color: var(--ink2); font-size: 13px; }
-  .wheel { display: flex; flex-direction: column; align-items: center; width: 96px; }
+  .wheel { display: flex; flex-direction: column; align-items: center; width: 96px; min-height: 0; }
   .wheel .k { color: var(--ink2); font-size: 14px; }
-  .col { position: relative; width: 56px; height: 180px; background: var(--track); border-radius: 8px; overflow: hidden; margin: 6px 0; }
+  .col { position: relative; width: 56px; flex: 1 1 0; min-height: 30px; background: var(--track); border-radius: 8px; overflow: hidden; margin: 4px 0; }
   .col .fill { position: absolute; left: 0; right: 0; }
   .col .strip { position: absolute; left: 40%; right: 40%; background: #ffffff99; }
   .col .zero { position: absolute; left: 0; right: 0; top: 50%; height: 2px; background: var(--zero); }
-  .wheel .v { font-size: 20px; font-weight: bold; } .wheel .s { color: var(--ink3); font-size: 11px; }
-  #status { color: #707070; font-size: 11px; text-align: center; margin-top: 14px; white-space: pre-line; }
+  .wheel .v { font-size: 17px; font-weight: bold; } .wheel .s { color: var(--ink3); font-size: 10px; }
+  #status { color: #707070; font-size: 10px; text-align: center; margin-top: 6px; white-space: pre-line; }
 </style>
 </head>
 <body>
@@ -121,12 +128,12 @@
 
 <main id="mirror">
   <div class="label">REWARD</div>
-  <div class="bar" style="height:56px" id="m-reward"><div class="fill"></div><div class="zero"></div><div class="text" style="font-size:22px"></div></div>
-  <div class="row" style="margin-top:8px">
+  <div class="bar" style="height:40px" id="m-reward"><div class="fill"></div><div class="zero"></div><div class="text" style="font-size:20px"></div></div>
+  <div class="row" style="margin-top:6px">
     <div class="tile"><div class="k">episode mean</div><div class="v" id="m-epmean">-</div></div>
     <div class="tile"><div class="k">last episode</div><div class="v" id="m-lastep">-</div></div>
   </div>
-  <div style="height:14px"></div>
+  <div style="height:6px"></div>
   <div class="gauge" id="m-angle"></div>
   <div class="gauge" id="m-rate"></div>
   <div class="label">COMMAND</div>
@@ -141,11 +148,9 @@
     <div class="wheel" id="m-wr"></div>
     <div class="count"><div class="k">count</div><div class="v" id="m-countr">-</div></div>
   </div>
-  <div class="row" style="margin-top:14px">
+  <div class="row tight" style="margin-top:6px; gap:6px">
     <div class="tile"><div class="k">loop</div><div class="v" id="m-hz">-</div></div>
     <div class="tile"><div class="k">step</div><div class="v" id="m-step">-</div></div>
-  </div>
-  <div class="row" style="margin-top:8px">
     <div class="tile"><div class="k">battery</div><div class="v" id="m-bat">-</div></div>
     <div class="tile"><div class="k">charger</div><div class="v" id="m-chg">-</div></div>
     <div class="tile"><div class="k">coil</div><div class="v" id="m-coil">-</div></div>
@@ -168,11 +173,32 @@ function show(view) {
 document.querySelectorAll(".tab").forEach(t => t.onclick = () => show(t.dataset.view));
 show(location.pathname.startsWith("/mirror") ? "mirror" : "drive");
 
+// --- link ----------------------------------------------------------------
+// One WebSocket both ways: the robot pushes its state ~25 times a second and
+// the stick goes out on every move. Plain HTTP (a post per command, a poll for
+// the state) is the fallback while the socket is down.
+let ws = null, wsUp = false, retry = 250;
+function connect() {
+  ws = new WebSocket("ws://" + location.host + "/ws");
+  ws.onopen = () => { wsUp = true; retry = 250; $("link").classList.add("ok"); };
+  ws.onmessage = e => { try { render(JSON.parse(e.data)); } catch (err) {} };
+  ws.onclose = () => {
+    wsUp = false; $("link").classList.remove("ok");
+    setTimeout(connect, retry); retry = Math.min(retry * 2, 4000);
+  };
+}
+function message(m) {
+  if (wsUp) { ws.send(JSON.stringify(m)); return Promise.resolve(); }
+  if (m.t === "mode") return post("/mode", { mode: m.mode });
+  return post("/cmd", m.t === "release" ? { release: true } : m);
+}
+
 // --- joystick ------------------------------------------------------------
-// Up is forward, right is turn right. The stick posts every 80 ms while held
-// (the robot lets go 0.5 s after the last post) and releases on lift.
+// Up is forward, right is turn right. Every move is sent at once (at most one
+// per animation frame), and the position is repeated every 100 ms while held,
+// because the robot lets go 0.5 s after the last one. Lifting releases.
 const pad = $("pad"), knob = $("knob");
-let stick = null, inflight = false, timer = null;
+let stick = null, inflight = false, timer = null, queued = false;
 
 function place(el, f, t) {   // f, t in [-1, 1] -> position in the pad
   el.style.left = (50 + 40 * t) + "%";
@@ -183,9 +209,16 @@ function post(path, body) {
                        body: JSON.stringify(body) });
 }
 function send() {
-  if (!stick || inflight) return;
+  if (!stick) return;
+  if (wsUp) { message({ t: "cmd", ...stick }); return; }
+  if (inflight) return;
   inflight = true;
   post("/cmd", stick).catch(() => {}).finally(() => inflight = false);
+}
+function sendSoon() {
+  if (queued) return;
+  queued = true;
+  requestAnimationFrame(() => { queued = false; send(); });
 }
 function fromEvent(e) {
   const r = pad.getBoundingClientRect();
@@ -202,24 +235,24 @@ pad.addEventListener("pointerdown", e => {
   pad.setPointerCapture(e.pointerId);
   pad.classList.add("held");
   stick = fromEvent(e); place(knob, stick.forward, stick.turn); send();
-  clearInterval(timer); timer = setInterval(send, 80);
+  clearInterval(timer); timer = setInterval(send, 100);
 });
 pad.addEventListener("pointermove", e => {
   if (!stick) return;
-  stick = fromEvent(e); place(knob, stick.forward, stick.turn);
+  stick = fromEvent(e); place(knob, stick.forward, stick.turn); sendSoon();
 });
 function lift() {
   if (!stick) return;
   stick = null; clearInterval(timer);
   pad.classList.remove("held"); place(knob, 0, 0);
-  post("/cmd", { release: true }).catch(() => {});
+  message({ t: "release" }).catch(() => {});
 }
 pad.addEventListener("pointerup", lift);
 pad.addEventListener("pointercancel", lift);
 document.addEventListener("visibilitychange", () => document.hidden && lift());
 
 document.querySelectorAll("[data-mode]").forEach(b =>
-  b.onclick = () => post("/mode", { mode: b.dataset.mode }).then(poll));
+  b.onclick = () => message({ t: "mode", mode: b.dataset.mode }).then(() => wsUp || poll()));
 
 // --- mirror widgets ------------------------------------------------------
 function setBar(el, v, lo, hi, color) {
@@ -306,7 +339,7 @@ function render(s) {
 }
 let polling = false;
 async function poll() {
-  if (polling) return;
+  if (polling || wsUp) return;
   polling = true;
   try {
     const r = await fetch("/state", { cache: "no-store" });
@@ -316,8 +349,8 @@ async function poll() {
     $("link").classList.remove("ok");
   } finally { polling = false; }
 }
+connect();
 setInterval(poll, 100);
-poll();
 </script>
 </body>
 </html>
