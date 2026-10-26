@@ -322,6 +322,15 @@ restart_asked = threading.Event()
 # ('hold' in its hello). Otherwise a fresh run would start out showing the
 # skill of the run before it.
 hold_weights = False
+# Pausing the robot (wheels held) or the training (learner idle) from the
+# dashboard, offered by a trainer that sends 'pause' in its hello. The trainer
+# owns both and answers every request with the state; the robot one is
+# applied here the moment it is asked for, so the wheels stop at once.
+can_pause = False
+robot_paused = False
+train_paused = False
+pause_lock = threading.Lock()
+pause_asked = {}   # web thread -> control loop: {'robot'/'training': bool}
 # This run's reward curve, weight updates and learner metrics, for the web
 # dashboard (dashboard.py); the live numbers come from web_state.
 history = dashboard.RunHistory()
@@ -396,7 +405,7 @@ def setup():
             print('dreamerBridge: could not pin the control thread: %s' % e)
     global web, web_url
     web = webui.WebUI(commands, history=history.snapshot,
-                      on_restart=request_restart)
+                      on_restart=request_restart, on_pause=request_pause)
     web_url = web.start() or ''
     load_reward_settings()
     from policy_runner import PolicyRunner
@@ -701,7 +710,7 @@ def loop():
             snap, _, _ = sample()
             cmd = commands.tick()
             _, act = runner.act(snap, cmd)
-            if hold_weights:
+            if hold_weights or robot_paused:
                 act = [0.0, 0.0]
                 stop_wheels()
             else:
@@ -750,6 +759,9 @@ def loop():
                 if header.get('type') == 'stats':
                     history.stats(header.get('stats'))
                     continue
+                if header.get('type') == 'pause':
+                    apply_pause(header)
+                    continue
                 if header.get('type') == 'weights_ready':
                     # Bootstrap: we came up without a policy, so the trainer is
                     # still driving. Once its weights land we can take over,
@@ -764,6 +776,9 @@ def loop():
                 act = header
         else:
             act = read()
+            while act.get('type') == 'pause':
+                apply_pause(act)
+                act = read()
         after_read = time.monotonic()
         if act is not None:
             if act['type'] != 'act':
@@ -798,6 +813,7 @@ def loop():
                    sensors=snap,
                    **latency_block(before_write, snap_stamp, snap_age)))
         step += 1
+        send_pause()
     except Exception as e:
         print('dreamerBridge: lost the trainer at step %d: %s' % (step, e))
         context.guiUpdater.setTrainerStatus('disconnected (%s)' % e)
@@ -998,6 +1014,9 @@ def web_state():
         weights_installed=weights_installed, stats=history.latest,
         can_restart=bool(trainer_restart and sock is not None and onboard),
         holding=hold_weights,
+        can_pause=bool(can_pause and sock is not None),
+        robot_paused=robot_paused, train_paused=train_paused,
+        train_started=history.train_started, waiting=history.waiting,
         grid=0.0 if commands.settings['mode'] == 'blend'
         else float(commands.settings.get('step') or 0.0))
 
@@ -1036,7 +1055,7 @@ def loop_onboard():
         snap, snap_stamp, snap_age = sample()
         cmd = commands.tick()
         obs, act = runner.act(snap, cmd)
-    if hold_weights:
+    if hold_weights or robot_paused:
         # Recorded as what it is: a step with the wheels held.
         act = [0.0, 0.0]
         stop_wheels()
@@ -1074,6 +1093,7 @@ def loop_onboard():
     step += 1
     if restart_asked.is_set():
         send_restart()
+    send_pause()
     drain_control()
     # The GRU half of the next step needs only the carry we already have. Do
     # it now, in the ~80 ms the RP2040 is busy, so that when the reply lands
@@ -1122,6 +1142,7 @@ def loop_trainer_serial():
                drive_ms=drive_ms, sensors=snap,
                **latency_block(tick, snap_stamp, snap_age)))
     step += 1
+    send_pause()
 
     # Wait for the action to this observation. A trainer that echoes `seq`
     # lets us tell it from a late reply to the previous one; one that does not
@@ -1135,6 +1156,8 @@ def loop_trainer_serial():
             kind = header.get('type')
             if kind == 'stats':
                 history.stats(header.get('stats'))
+            elif kind == 'pause':
+                apply_pause(header)
             elif kind == 'weights_ready':
                 runner.install(payload, header.get('stamp'))
                 print('dreamerBridge: got a policy, reconnecting to '
@@ -1205,6 +1228,8 @@ def drain_control():
             # The learner's latest metrics, forwarded by the trainer for the
             # web dashboard only.
             history.stats(header.get('stats'))
+        elif kind == 'pause':
+            apply_pause(header)
         elif kind in ('act', 'ctrl'):
             apply_overrides(header)
             note_reward(float(header.get('reward', 0.0)))
@@ -1241,6 +1266,46 @@ def send_restart():
     reward_avg = 0.0
     print('dreamerBridge: asked the trainer for a fresh run')
     context.guiUpdater.setTrainerStatus('restarting training')
+
+
+def request_pause(robot=None, training=None):
+    """From the web page's thread: pause (True) or start (False) the robot
+    and/or the training. The control loop sends it; the robot is held or let
+    go here at once rather than a round trip later."""
+    global robot_paused
+    if not (can_pause and sock is not None):
+        raise ValueError('this trainer cannot pause')
+    with pause_lock:
+        if robot is not None:
+            pause_asked['robot'] = robot_paused = bool(robot)
+        if training is not None:
+            pause_asked['training'] = bool(training)
+
+
+def send_pause():
+    """Pass the dashboard's pause requests on to the trainer."""
+    if not pause_asked:
+        return
+    with pause_lock:
+        asked = dict(pause_asked)
+        pause_asked.clear()
+    write(dict(type='pause', **asked))
+
+
+def apply_pause(state):
+    """The trainer's pause state, from its hello or an answer to a request.
+    A trainer that does not offer pausing (state None) pauses nothing."""
+    global robot_paused, train_paused
+    state = state or {}
+    was = (robot_paused, train_paused)
+    robot_paused = bool(state.get('robot', False))
+    train_paused = bool(state.get('training', False))
+    history.training(state.get('train_started_ago'),
+                     state.get('waiting', False))
+    if (robot_paused, train_paused) != was:
+        print('dreamerBridge: robot %s, training %s' % (
+            'paused' if robot_paused else 'running',
+            'paused' if train_paused else 'running'))
 
 
 def weights_dir():
@@ -1600,6 +1665,11 @@ def connect():
         trainer_restart = bool(hello.get('restart', False))
         hold_weights = bool(hello.get('hold', False))
         restart_asked.clear()
+        global can_pause
+        can_pause = hello.get('pause') is not None
+        with pause_lock:
+            pause_asked.clear()
+        apply_pause(hello.get('pause'))
         max_hz = float(hello.get('max_hz', settings['max_hz']))
         if pace not in ('serial', 'clock'):
             raise ValueError('Unknown pacing %r' % pace)

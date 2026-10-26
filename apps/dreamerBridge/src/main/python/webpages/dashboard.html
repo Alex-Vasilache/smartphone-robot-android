@@ -152,6 +152,8 @@ main {
 #restart { border-color: var(--crit); color: var(--crit); }
 #restart.armed { background: var(--crit); color: var(--panel); }
 #restart:disabled { opacity: 0.6; cursor: default; }
+.pause.go { border-color: var(--good); color: var(--good); }
+.pause:disabled { opacity: 0.6; cursor: default; }
 .wrow { display: flex; gap: 26px; flex-wrap: wrap; align-items: flex-end; margin-bottom: 8px; }
 .chip { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; letter-spacing: 0.1em; }
 .chip .dot { width: 8px; height: 8px; border-radius: 50%; }
@@ -169,13 +171,15 @@ main {
   <div class="kv"><span class="k">gradient updates</span><span class="v" id="h-upd">—</span></div>
   <div class="spacer"></div>
   <span class="chip" id="h-link"><span class="dot"></span><span>—</span></span>
+  <button id="pause-robot" class="pause" type="button" hidden title="Hold the wheels, or let the policy drive them">PAUSE ROBOT</button>
+  <button id="pause-train" class="pause" type="button" hidden title="Stop or start the learner's updates">PAUSE TRAINING</button>
   <button id="restart" type="button" hidden title="Start training again from random weights">RESTART TRAINING</button>
   <button id="theme" type="button">THEME</button>
 </header>
 
 <main>
   <section class="panel" style="grid-area: reward">
-    <div class="title">Reward <span class="tag">per robot step, since the run started</span></div>
+    <div class="title">Reward <span class="tag" id="r-tag">per robot step, since the run started</span></div>
     <div class="hero">
       <div>
         <div class="big" id="r-avg">—</div>
@@ -335,6 +339,10 @@ const METRICS = [
   ['ret', 'Imagined return'],
 ];
 let run = null, t0 = 0, clockSkew = 0;
+// Minute 0 of every chart. A run started paused (PAUSED=1 tools/robot/train.sh)
+// counts from when training was first started, so the robot's behaviour
+// before it reads as -2m, -1m; until then, from now. Otherwise from t0.
+let trainStarted = null, waiting = false;
 let bins = [];               // [t (s since t0), mean reward]
 let curBin = null;           // [index, sum, n]
 let weights = [];            // [t, age at install]
@@ -346,6 +354,7 @@ async function loadHistory() {
   try {
     const h = await (await fetch('/history', {cache: 'no-store'})).json();
     run = h.run; t0 = h.t0 || 0;
+    trainStarted = h.train_started ?? null; waiting = !!h.waiting;
     clockSkew = (h.now || Date.now() / 1000) - Date.now() / 1000;
     bins = h.reward || []; weights = h.weights || []; stats = h.stats || [];
     curBin = null;
@@ -355,6 +364,8 @@ async function loadHistory() {
   } catch (e) { /* the live stream still works */ }
 }
 const phoneNow = () => Date.now() / 1000 + clockSkew;
+const origin = () => trainStarted ?? (waiting ? phoneNow() : t0);
+const shiftMin = () => (t0 - origin()) / 60;   // add to (s since t0) / 60
 
 // A new run (a trainer connected with another name, e.g. after RESTART):
 // everything this page gathered belongs to the old one.
@@ -375,6 +386,8 @@ function onState(s) {
   showRestart(s);
   if (s.now) clockSkew = s.now - Date.now() / 1000;
   if (s.t0) t0 = s.t0;
+  if (s.train_started !== undefined) { trainStarted = s.train_started; waiting = !!s.waiting; }
+  showPause(s);
   // one reward per state frame is a sample of the stream, not every step:
   // the per-second bins come from the phone's /history, which sees them all.
   const stepped = s.step !== lastStep; lastStep = s.step;
@@ -422,6 +435,32 @@ function connect() {
   ws.onopen = () => { socket = ws; setLink(true, 'LIVE'); };
   ws.onclose = () => { socket = null; setLink(false, 'RECONNECTING'); setTimeout(connect, 1000); };
 }
+
+// ---------- pause ----------
+// Offered by a trainer that can pause (every current one). One press each:
+// pausing is undone by the next press, unlike a restart.
+const pauseRobotBtn = document.getElementById('pause-robot');
+const pauseTrainBtn = document.getElementById('pause-train');
+function showPause(s) {
+  for (const [btn, paused, what] of [[pauseRobotBtn, s.robot_paused, 'ROBOT'],
+                                     [pauseTrainBtn, s.train_paused, 'TRAINING']]) {
+    btn.hidden = !s.can_pause;
+    if (btn._sent !== undefined && btn._sent !== !!paused && performance.now() - btn._at < 5000) continue;
+    btn._sent = undefined; btn.disabled = false;
+    btn.textContent = (paused ? 'START ' : 'PAUSE ') + what;
+    btn.classList.toggle('go', !!paused);
+  }
+}
+async function sendPause(btn, key) {
+  const pause = !btn.classList.contains('go');
+  btn._sent = pause; btn._at = performance.now(); btn.disabled = true;
+  try {
+    if (socket && socket.readyState === 1) socket.send(JSON.stringify({t: 'pause', [key]: pause}));
+    else if (!(await fetch('/pause', {method: 'POST', body: JSON.stringify({[key]: pause})})).ok) throw new Error();
+  } catch (e) { btn._sent = undefined; btn.disabled = false; }
+}
+pauseRobotBtn.onclick = () => sendPause(pauseRobotBtn, 'robot');
+pauseTrainBtn.onclick = () => sendPause(pauseTrainBtn, 'training');
 
 // ---------- restart ----------
 // Offered only by a trainer started with tools/robot/demo.sh. Two presses, so
@@ -479,7 +518,7 @@ function niceTicks(lo, hi, n) {
   const out = []; for (let v = Math.ceil(lo / step) * step; v <= hi + 1e-9; v += step) out.push(+v.toFixed(10));
   return out;
 }
-const fmtTime = (s) => { s = Math.max(0, s); const m = Math.floor(s / 60); return m >= 60 ? `${Math.floor(m / 60)}h${String(m % 60).padStart(2, '0')}` : `${m}:${String(Math.floor(s % 60)).padStart(2, '0')}`; };
+const fmtTime = (s) => { if (s < 0) return '-' + fmtTime(-s); const m = Math.floor(s / 60); return m >= 60 ? `${Math.floor(m / 60)}h${String(m % 60).padStart(2, '0')}` : `${m}:${String(Math.floor(s % 60)).padStart(2, '0')}`; };
 // Always signed, so a value crossing zero keeps its width.
 const signed = (v, d = 2) => (v === null || v === undefined || !Number.isFinite(v)) ? '—' : (v < 0 ? '-' : '+') + Math.abs(v).toFixed(d);
 const fmt = (v, d = 2) => (v === null || v === undefined || !Number.isFinite(v)) ? '—' : (Math.abs(v) >= 1000 ? v.toFixed(0) : v.toFixed(d));
@@ -515,6 +554,12 @@ function drawChart(el, series, opt = {}) {
   if (y0 < 0 && y1 > 0 && opt.zero) {
     g.strokeStyle = css('--rule'); const y = Math.round(Y(0)) + 0.5;
     g.beginPath(); g.moveTo(pad.l, y); g.lineTo(W - pad.r, y); g.stroke();
+  }
+  if (opt.vline !== undefined && opt.vline > x0 && opt.vline < x1) {
+    g.strokeStyle = css('--good'); g.setLineDash([4, 4]); const x = Math.round(X(opt.vline)) + 0.5;
+    g.beginPath(); g.moveTo(x, pad.t); g.lineTo(x, H - pad.b); g.stroke(); g.setLineDash([]);
+    g.fillStyle = css('--good'); g.textAlign = 'left'; g.textBaseline = 'top';
+    g.fillText('TRAINING STARTS', x + 4, pad.t + 2); g.fillStyle = css('--muted');
   }
   if (opt.xlabels !== false) {
     g.textAlign = 'center'; g.textBaseline = 'top';
@@ -571,15 +616,19 @@ function movingAverage(pts, window) {
   return out;
 }
 function drawReward() {
-  const raw = bins.map(([t, r]) => [t / 60, r]);
-  const avg = movingAverage(bins, AVG_WINDOW).map(([t, r]) => [t / 60, r]);
-  const tNow = (phoneNow() - t0) / 60;
+  const sh = shiftMin();
+  const raw = bins.map(([t, r]) => [t / 60 + sh, r]);
+  const avg = movingAverage(bins, AVG_WINDOW).map(([t, r]) => [t / 60 + sh, r]);
+  const tNow = (phoneNow() - origin()) / 60, x0 = Math.min(0, sh);
   drawChart(rewardEl, [
     {pts: raw, color: css('--raw'), width: 1, gap: 0.2},
     {pts: avg, color: css('--series-1'), width: 2.5, gap: 0.2},
-  ], {x0: 0, x1: Math.max(tNow, 1), zero: true, xfmt: v => `${v}m`, yticks: 5,
+  ], {x0, x1: Math.max(tNow, x0 + 1), zero: true, xfmt: v => `${v}m`, yticks: 5,
+      vline: sh < 0 && !waiting ? 0 : undefined,
       empty: 'waiting for the first rewards',
       tip: (x, y) => `${fmtTime(x * 60)} · ${fmt(y, 3)} / step`});
+  document.getElementById('r-tag').textContent = waiting ? 'per robot step · training not started yet'
+    : sh < 0 ? 'per robot step · minute 0 is when training started' : 'per robot step, since the run started';
   document.getElementById('r-avg').textContent = avg.length ? signed(avg[avg.length - 1][1], 2) : '—';
 }
 function drawInst() {
@@ -600,7 +649,8 @@ for (const [key, label] of METRICS) {
 function drawMetrics() {
   for (const [key, label] of METRICS) {
     const el = document.getElementById('c-' + key);
-    const pts = stats.filter(([, v]) => v && Number.isFinite(v[key])).map(([t, v]) => [t / 60, v[key]]);
+    const sh = shiftMin();
+    const pts = stats.filter(([, v]) => v && Number.isFinite(v[key])).map(([t, v]) => [t / 60 + sh, v[key]]);
     if (!el._wired) { hoverable(el, drawMetrics); el._wired = true; }
     drawChart(el, [{pts, color: css('--series-1'), width: 2}],
       {xfmt: v => `${v}m`, xticks: 4, yticks: 3, pad: {l: 40}, empty: 'no learner metrics yet',
@@ -613,7 +663,8 @@ function drawMetrics() {
 const weightsEl = document.getElementById('weights-chart');
 hoverable(weightsEl, drawWeights);
 function drawWeights() {
-  const pts = weights.filter(w => w[1] !== null && Number.isFinite(w[1]) && w[1] > -60).map(([t, a]) => [t / 60, a]);
+  const sh = shiftMin();
+  const pts = weights.filter(w => w[1] !== null && Number.isFinite(w[1]) && w[1] > -60).map(([t, a]) => [t / 60 + sh, a]);
   drawChart(weightsEl, [{pts, color: css('--series-1'), dots: 2}],
     {ymin: 0, xfmt: v => `${v}m`, xticks: 5, yticks: 3, empty: 'no weight updates yet',
      tip: (x, y) => `${fmtTime(x * 60)} · ${fmt(y, 1)} s old`});
@@ -792,7 +843,8 @@ function drawBlueprint() {
 function drawHeader() {
   const s = lastState || {};
   $('h-run').textContent = run || '—';
-  $('h-time').textContent = t0 && run ? fmtTime(phoneNow() - t0) : '—';
+  $('h-time').textContent = !(t0 && run) ? '—' : waiting ? 'not started'
+    : fmtTime(phoneNow() - origin()) + (s.train_paused ? ' · paused' : '');
   $('h-hz').textContent = s.hz ? `${s.hz.toFixed(0)} Hz` : '—';
   $('h-step').textContent = s.step !== undefined ? s.step.toLocaleString() : '—';
   const st = s.stats || {};

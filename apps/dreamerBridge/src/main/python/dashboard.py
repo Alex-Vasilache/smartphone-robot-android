@@ -23,6 +23,11 @@ class RunHistory:
         self.run = None
         self.t0 = time.time()
         self.latest = {}       # the learner's last forwarded metrics
+        # When training started (this clock), for a run started paused; the
+        # page draws that moment as minute 0. None: since the run started,
+        # or, with `waiting`, not yet (the page counts back from now).
+        self.train_started = None
+        self.waiting = False
         self._reset()
 
     def _reset(self):
@@ -40,6 +45,8 @@ class RunHistory:
                 self.run = run
                 self.t0 = time.time()
                 self.latest = {}
+                self.train_started = None
+                self.waiting = False
                 self._reset()
 
     def reward(self, value):
@@ -73,10 +80,20 @@ class RunHistory:
             self.latest = dict(values)
             self._append(self._stats, [time.time() - self.t0, dict(values)])
 
+    def training(self, started_ago, waiting):
+        """The trainer's pause state: how long ago training started (an age,
+        so the trainer's clock need not agree with this one), and whether a
+        run started paused is still waiting for it."""
+        with self._lock:
+            self.train_started = (None if started_ago is None
+                                  else time.time() - float(started_ago))
+            self.waiting = bool(waiting)
+
     def snapshot(self):
         with self._lock:
             return dict(
                 run=self.run, t0=self.t0, now=time.time(),
+                train_started=self.train_started, waiting=self.waiting,
                 reward=list(self._rewards), weights=list(self._weights),
                 stats=list(self._stats))
 

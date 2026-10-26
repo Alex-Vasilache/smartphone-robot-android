@@ -16,6 +16,8 @@ a live blueprint of the robot.
     POST /cmd         {"forward": f, "turn": t} in [-1, 1], or {"release": true}
     POST /mode        {"mode": "auto" | "manual" | "direct" | "blend"}
     POST /restart     train from scratch (a tools/robot/demo.sh trainer only)
+    POST /pause       {"robot": bool} and/or {"training": bool}: pause (true)
+                      or start the robot's wheels or the learner
 
 The page talks over one WebSocket. Polling plain HTTP was measured at ~110 ms
 (p50) from a posted command to the page seeing it, up to ~250 ms: a fresh TCP
@@ -105,11 +107,13 @@ class _Client:
 
 class WebUI:
 
-    def __init__(self, commands, port=PORT, history=None, on_restart=None):
+    def __init__(self, commands, port=PORT, history=None, on_restart=None,
+                 on_pause=None):
         self.commands = commands
         self.port = port
         self.history = history or dict  # () -> the run's history as a dict
         self.on_restart = on_restart    # () -> None; raises if not offered
+        self.on_pause = on_pause        # (robot, training) -> None; likewise
         self.state = {}   # the latest published, never mutated
         self.page = pkgutil.get_data('webpages', 'index.html')
         self.dash = pkgutil.get_data('webpages', 'dashboard.html')
@@ -162,6 +166,10 @@ class WebUI:
             if self.on_restart is None:
                 raise ValueError('restart is not available')
             self.on_restart()
+        elif kind == 'pause':
+            if self.on_pause is None:
+                raise ValueError('pausing is not available')
+            self.on_pause(message.get('robot'), message.get('training'))
         else:
             raise ValueError('unknown message %r' % kind)
 
@@ -213,6 +221,8 @@ class WebUI:
                         ui.handle(dict(body, t='mode'))
                     elif path == '/restart':
                         ui.handle(dict(t='restart'))
+                    elif path == '/pause':
+                        ui.handle(dict(body, t='pause'))
                     else:
                         return self._send(404, b'not found', 'text/plain')
                     self._json(dict(ok=True))
