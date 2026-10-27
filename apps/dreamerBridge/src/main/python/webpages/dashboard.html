@@ -170,6 +170,9 @@ body.with-joy .layout > main { overflow-y: auto; }
 .bp-accfill { fill: var(--series-2); }
 .bp-floor { stroke: var(--ink-soft); fill: none; stroke-width: 0.8; }
 #restart { border-color: var(--crit); color: var(--crit); }
+/* Fixed widths, so a label change never reflows the header. */
+#restart { min-width: 22.5ch; }
+.pause { min-width: 18ch; }
 #restart.armed { background: var(--crit); color: var(--panel); }
 #restart:disabled { opacity: 0.6; cursor: default; }
 .pause.go { border-color: var(--good); color: var(--good); }
@@ -510,7 +513,10 @@ function showPause(s) {
     btn.hidden = !s.can_pause;
     if (btn._sent !== undefined && btn._sent !== !!paused && performance.now() - btn._at < 5000) continue;
     btn._sent = undefined; btn.disabled = false;
-    btn.textContent = (paused ? 'START ' : 'PAUSE ') + what;
+    // Only on a change: the state arrives ~65 times a second, and a click
+    // whose text node was replaced between press and release never fires.
+    const label = (paused ? 'START ' : 'PAUSE ') + what;
+    if (btn.textContent !== label) btn.textContent = label;
     btn.classList.toggle('go', !!paused);
   }
 }
@@ -548,7 +554,7 @@ function showPolicy(s) {
   const now = s.playing || '';
   if (policySent !== null && policySent !== now && performance.now() - policyAt < 5000) return;
   policySent = null; policySel.disabled = false;
-  policySel.value = now;
+  if (policySel.value !== now) policySel.value = now;
   policySel.classList.toggle('playing', !!s.playing);
 }
 policySel.onchange = async () => {
@@ -583,7 +589,7 @@ restartBtn.onclick = async () => {
   if (restarting) return;
   if (!restartArmed) {
     restartArmed = setTimeout(restartDone, 4000);
-    restartBtn.classList.add('armed'); restartBtn.textContent = 'PRESS AGAIN TO RESTART';
+    restartBtn.classList.add('armed'); restartBtn.textContent = 'PRESS AGAIN';
     return;
   }
   clearTimeout(restartArmed); restartArmed = null;
