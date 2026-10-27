@@ -99,6 +99,22 @@ main {
 @media (max-width: 980px) {
   main { grid-template-columns: 1fr; grid-template-areas: "reward" "bp" "weights" "metrics"; }
 }
+/* The joystick page (/drive) beside the dashboard, phone-sized. */
+/* With it shown the page is one screen: the dashboard scrolls beside it. */
+body.with-joy { display: flex; flex-direction: column; height: 100vh; height: 100dvh; }
+body.with-joy .layout { flex: 1; min-height: 0; }
+body.with-joy .layout > main { overflow-y: auto; }
+.layout { display: flex; align-items: stretch; }
+.layout > main { flex: 1; min-width: 0; }
+#joy {
+  flex: none; width: 380px; border-left: 1px solid var(--rule); background: var(--panel);
+}
+#joy.left { order: -1; border-left: none; border-right: 1px solid var(--rule); }
+#joy iframe { display: block; width: 100%; height: 100%; border: 0; }
+@media (max-width: 760px) {
+  #joy { display: none; }
+  body.with-joy { display: block; height: auto; }
+}
 .panel {
   position: relative; background: var(--panel); border: 1px solid var(--rule);
   padding: 12px 14px 14px; min-width: 0;
@@ -153,8 +169,10 @@ main {
 #restart.armed { background: var(--crit); color: var(--panel); }
 #restart:disabled { opacity: 0.6; cursor: default; }
 .pause.go { border-color: var(--good); color: var(--good); }
+#joy-btn.go { border-color: var(--ink); color: var(--ink); }
 .pause:disabled { opacity: 0.6; cursor: default; }
 select#policy {
+  max-width: 240px;
   font: inherit; color: var(--text-2); background: var(--panel); cursor: pointer;
   border: 1px solid var(--rule); padding: 4px 6px; letter-spacing: 0.12em;
 }
@@ -180,9 +198,11 @@ select#policy.playing { border-color: var(--good); color: var(--good); }
   <button id="pause-robot" class="pause" type="button" hidden title="Hold the wheels, or let the policy drive them">PAUSE ROBOT</button>
   <button id="pause-train" class="pause" type="button" hidden title="Stop or start the learner's updates">PAUSE TRAINING</button>
   <button id="restart" type="button" hidden title="Start training again from random weights">RESTART TRAINING</button>
+  <button id="joy-btn" type="button" title="Show or hide the joystick (?joy=left puts it on the left)">JOYSTICK</button>
   <button id="theme" type="button">THEME</button>
 </header>
 
+<div class="layout">
 <main>
   <section class="panel" style="grid-area: reward">
     <div class="title">Reward <span class="tag" id="r-tag">per robot step, since the run started</span></div>
@@ -316,6 +336,8 @@ select#policy.playing { border-color: var(--good); color: var(--good); }
     <div class="metrics" id="metrics"></div>
   </section>
 </main>
+<aside id="joy" hidden><iframe title="joystick" allow="fullscreen"></iframe></aside>
+</div>
 
 <script>
 'use strict';
@@ -326,6 +348,7 @@ function applyTheme(t) {
   if (t) root.setAttribute('data-theme', t); else root.removeAttribute('data-theme');
   try { t ? localStorage.setItem('dash-theme', t) : localStorage.removeItem('dash-theme'); } catch (e) {}
   redrawAll();
+  loadJoy();
 }
 themeBtn.onclick = () => {
   const dark = getComputedStyle(root).colorScheme.includes('dark');
@@ -334,6 +357,32 @@ themeBtn.onclick = () => {
 try { const t = localStorage.getItem('dash-theme'); if (t) root.setAttribute('data-theme', t); } catch (e) {}
 { const t = new URLSearchParams(location.search).get('theme'); if (t === 'dark' || t === 'light') root.setAttribute('data-theme', t); }
 const css = (name) => getComputedStyle(root).getPropertyValue(name).trim();
+
+// ---------- joystick ----------
+// The phone's own joystick page in a phone-width column, in this page's theme.
+const joy = document.getElementById('joy');
+const joyFrame = joy.querySelector('iframe');
+const joyBtn = document.getElementById('joy-btn');
+function loadJoy() {
+  if (joy.hidden) return;
+  const theme = getComputedStyle(root).colorScheme.includes('dark') ? 'dark' : 'light';
+  const src = `/drive?embed=1&theme=${theme}`;
+  if (joyFrame.getAttribute('src') !== src) joyFrame.setAttribute('src', src);
+}
+function showJoy(on) {
+  joy.hidden = !on; joyBtn.classList.toggle('go', on);
+  document.body.classList.toggle('with-joy', on);
+  try { localStorage.setItem('dash-joy', on ? '1' : '0'); } catch (e) {}
+  loadJoy();
+}
+joyBtn.onclick = () => showJoy(joy.hidden);
+{
+  const q = new URLSearchParams(location.search).get('joy');
+  if (q === 'left') joy.classList.add('left');
+  let on = q ? q !== 'off' : true;
+  try { const v = localStorage.getItem('dash-joy'); if (!q && v !== null) on = v === '1'; } catch (e) {}
+  showJoy(on);
+}
 
 // ---------- data ----------
 const TOP_SPEED = 5700;      // the phone's wheel-speed units at full output, in the air
