@@ -74,9 +74,13 @@ body {
   letter-spacing: 0.02em;
 }
 header {
-  display: flex; align-items: center; gap: 22px; flex-wrap: wrap;
-  padding: 12px 18px; border-bottom: 1px solid var(--rule);
+  display: flex; align-items: center; gap: 6px 14px; flex-wrap: wrap;
+  padding: 5px 14px; border-bottom: 1px solid var(--rule);
 }
+header button, header select#policy { padding: 2px 8px; font-size: 12px; }
+header .kv .k { font-size: 9px; }
+header .kv .v { font-size: 13px; line-height: 1.2; }
+header .spacer { flex: 1 0 0; }
 header h1 {
   margin: 0; font-size: 14px; font-weight: 600; letter-spacing: 0.22em;
   text-shadow: var(--glow);
@@ -172,7 +176,7 @@ body.with-joy .layout > main { overflow-y: auto; }
 #joy-btn.go { border-color: var(--ink); color: var(--ink); }
 .pause:disabled { opacity: 0.6; cursor: default; }
 select#policy {
-  max-width: 240px;
+  max-width: 200px;
   font: inherit; color: var(--text-2); background: var(--panel); cursor: pointer;
   border: 1px solid var(--rule); padding: 4px 6px; letter-spacing: 0.12em;
 }
@@ -421,6 +425,9 @@ async function loadHistory() {
 const phoneNow = () => Date.now() / 1000 + clockSkew;
 const origin = () => trainStarted ?? (waiting ? phoneNow() : t0);
 const shiftMin = () => (t0 - origin()) / 60;   // add to (s since t0) / 60
+// Charts go back at most this far before training starts (minutes).
+const PRE_MIN = 2;
+const sincePre = (pts) => pts.filter(p => p[0] >= -PRE_MIN);
 
 // A new run (a trainer connected with another name, e.g. after RESTART):
 // everything this page gathered belongs to the old one.
@@ -710,9 +717,9 @@ function movingAverage(pts, window) {
 }
 function drawReward() {
   const sh = shiftMin();
-  const raw = bins.map(([t, r]) => [t / 60 + sh, r]);
-  const avg = movingAverage(bins, AVG_WINDOW).map(([t, r]) => [t / 60 + sh, r]);
-  const tNow = (phoneNow() - origin()) / 60, x0 = Math.min(0, sh);
+  const raw = sincePre(bins.map(([t, r]) => [t / 60 + sh, r]));
+  const avg = sincePre(movingAverage(bins, AVG_WINDOW).map(([t, r]) => [t / 60 + sh, r]));
+  const tNow = (phoneNow() - origin()) / 60, x0 = Math.max(-PRE_MIN, Math.min(0, sh));
   drawChart(rewardEl, [
     {pts: raw, color: css('--raw'), width: 1, gap: 0.2},
     {pts: avg, color: css('--series-1'), width: 2.5, gap: 0.2},
@@ -743,7 +750,7 @@ function drawMetrics() {
   for (const [key, label] of METRICS) {
     const el = document.getElementById('c-' + key);
     const sh = shiftMin();
-    const pts = stats.filter(([, v]) => v && Number.isFinite(v[key])).map(([t, v]) => [t / 60 + sh, v[key]]);
+    const pts = sincePre(stats.filter(([, v]) => v && Number.isFinite(v[key])).map(([t, v]) => [t / 60 + sh, v[key]]));
     if (!el._wired) { hoverable(el, drawMetrics); el._wired = true; }
     drawChart(el, [{pts, color: css('--series-1'), width: 2}],
       {xfmt: v => `${v}m`, xticks: 4, yticks: 3, pad: {l: 40}, empty: 'no learner metrics yet',
@@ -757,7 +764,7 @@ const weightsEl = document.getElementById('weights-chart');
 hoverable(weightsEl, drawWeights);
 function drawWeights() {
   const sh = shiftMin();
-  const pts = weights.filter(w => w[1] !== null && Number.isFinite(w[1]) && w[1] > -60).map(([t, a]) => [t / 60 + sh, a]);
+  const pts = sincePre(weights.filter(w => w[1] !== null && Number.isFinite(w[1]) && w[1] > -60).map(([t, a]) => [t / 60 + sh, a]));
   drawChart(weightsEl, [{pts, color: css('--series-1'), dots: 2}],
     {ymin: 0, xfmt: v => `${v}m`, xticks: 5, yticks: 3, empty: 'no weight updates yet',
      tip: (x, y) => `${fmtTime(x * 60)} · ${fmt(y, 1)} s old`});
