@@ -1031,7 +1031,7 @@ def web_state():
         holding=hold_weights,
         can_pause=bool(can_pause and sock is not None),
         playing=player['name'] if player is not None else None,
-        policies=policy_names(), can_train=not player_policy,
+        policies=policy_names(), can_train=True,
         robot_paused=robot_paused, train_paused=train_paused,
         train_started=history.train_started, waiting=history.waiting,
         grid=0.0 if commands.settings['mode'] == 'blend'
@@ -1303,11 +1303,7 @@ def policy_names():
 def request_play(name):
     """From the web page's thread: play the saved policy `name`, or go back
     to training (None). The control loop makes the switch."""
-    if name is None:
-        if player_policy:
-            raise ValueError('started from the Dreamer Player: no training '
-                             'to go back to')
-    elif not os.path.exists(os.path.join(policies_dir(), name + '.npz')):
+    if name is not None and not os.path.exists(os.path.join(policies_dir(), name + '.npz')):
         raise ValueError('no saved policy %r' % name)
     with play_lock:
         play_asked[:] = [name]
@@ -1323,7 +1319,7 @@ def switch_policy():
         if not play_asked:
             return
         name = play_asked.pop()
-    if name is None and training_saved is None:
+    if name is None and player is None:
         return
     if name is not None and player is not None and name == player['name']:
         return
@@ -1333,15 +1329,24 @@ def switch_policy():
     prev_act = (0.0, 0.0)
     if name is None:
         saved, training_saved = training_saved, None
+        if saved is None:
+            # Started from the Dreamer Player: train as a fresh bridge would,
+            # on the last weights a trainer pushed.
+            from policy_runner import PolicyRunner
+            saved = dict(mode='auto', state=(
+                None, PolicyRunner(boot_policy()), False, False, MAX_HZ, 1.0,
+                PACE, 0.0, False, False))
         (player, runner, onboard, standalone, max_hz, cmd_scale, pace,
          command_bias, friction_comp, hold_weights) = saved['state']
         commands.set_mode(saved['mode'])
+        context.setStopVisible(False)
         if runner is not None:
             runner.reset()
         last_attempt = 0.0   # reconnect on the next step
         print('dreamerBridge: back to training')
         context.guiUpdater.setTrainerStatus('back to training: connecting')
         return
+    training = player is None
     state = (player, runner, onboard, standalone, max_hz, cmd_scale, pace,
              command_bias, friction_comp, hold_weights)
     mode = commands.settings['mode']
@@ -1351,11 +1356,12 @@ def switch_policy():
     except Exception as e:  # noqa: BLE001 -- keep doing what we were doing
         print('dreamerBridge: cannot play %s: %s' % (name, e))
         return
-    if training_saved is None and not player_policy:
+    if training:
         training_saved = dict(state=state, mode=mode)
         # Let the trainer go; it waits for the reconnect.
         disconnect()
         restart_asked.clear()
+    context.setStopVisible(True)
     context.guiUpdater.setTrainerStatus('playing %s' % player['name'])
 
 

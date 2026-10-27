@@ -5,6 +5,13 @@ import android.net.wifi.WifiManager
 import android.content.Intent
 import android.os.Bundle
 import android.os.Process
+import android.graphics.Color
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
+import android.view.Gravity
+import android.view.View
+import android.widget.LinearLayout
+import android.widget.TextView
 import androidx.activity.addCallback
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
@@ -40,6 +47,10 @@ open class MainActivity : AbcvlibActivity(), SerialReadyListener {
      */
     private var wifiLock: WifiManager.WifiLock? = null
 
+    /** STOP, shown while a saved policy drives (setStopVisible). */
+    private lateinit var stopButton: TextView
+    private var statusMargin = -1   // the layout's own, restored on hiding
+
     override fun onCreate(savedInstanceState: Bundle?) {
         enableMainLoop(false)
         // The serial reader hex-dumps every chunk at debug level; that runs
@@ -56,6 +67,7 @@ open class MainActivity : AbcvlibActivity(), SerialReadyListener {
             systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
         }
         guiUpdater = GuiUpdater(binding, this)
+        addStopButton()
         // A robot run is unattended; letting the screen sleep would suspend the
         // control loop and the trainer would sit blocked waiting for us.
         binding.root.keepScreenOn = true
@@ -85,6 +97,65 @@ open class MainActivity : AbcvlibActivity(), SerialReadyListener {
             Logger.i("MainActivity", "no_base set in trainer.json; starting without the robot")
             initPython()
         }
+    }
+
+    /**
+     * Full width at the very bottom of the screen, big enough to hit on a
+     * moving robot. Hidden until a saved policy drives: always in the Dreamer
+     * Player, and when one is chosen on the web dashboard during training.
+     */
+    private fun addStopButton() {
+        val density = resources.displayMetrics.density
+        stopButton = TextView(this).apply {
+            text = "STOP"
+            gravity = Gravity.CENTER
+            setTextColor(Color.WHITE)
+            textSize = 22f
+            letterSpacing = 0.15f
+            typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+            background = GradientDrawable().apply {
+                setColor(Color.parseColor("#FFC0392B"))
+                cornerRadius = 10 * density
+            }
+            isClickable = true
+            visibility = View.GONE
+            setOnClickListener { stopAndReturn() }
+        }
+        binding.root.addView(stopButton, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, (64 * density).toInt()
+        ).apply { topMargin = (8 * density).toInt() })
+    }
+
+    /** From Python, on any thread. */
+    fun setStopVisible(visible: Boolean) {
+        runOnUiThread {
+            stopButton.visibility = if (visible) View.VISIBLE else View.GONE
+            // The status lines keep a strip free below them; the button takes it.
+            val params = binding.status.layoutParams as LinearLayout.LayoutParams
+            if (statusMargin < 0) statusMargin = params.bottomMargin
+            params.bottomMargin =
+                if (visible) (8 * resources.displayMetrics.density).toInt() else statusMargin
+            binding.status.requestLayout()
+        }
+    }
+
+    /** Brake both wheels at once, with no slew limit. */
+    protected fun brake() {
+        try {
+            outputs.setWheelOutput(0.0f, 0.0f, true, true, 2.0f)
+        } catch (e: Exception) {
+            // No base (or not up yet): nothing to stop. Ending the process
+            // stops the commands either way, and the base stops the wheels by
+            // itself 250 ms after they stop.
+        }
+    }
+
+    /** Wheels off now, then to the policy list, as the back button does. */
+    protected open fun stopAndReturn() {
+        brake()
+        startActivity(Intent(this, PickerActivity::class.java))
+        finish()
+        Process.killProcess(Process.myPid())
     }
 
     private fun noBase(): Boolean = try {
