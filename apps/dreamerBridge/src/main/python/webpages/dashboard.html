@@ -154,6 +154,11 @@ main {
 #restart:disabled { opacity: 0.6; cursor: default; }
 .pause.go { border-color: var(--good); color: var(--good); }
 .pause:disabled { opacity: 0.6; cursor: default; }
+select#policy {
+  font: inherit; color: var(--text-2); background: var(--panel); cursor: pointer;
+  border: 1px solid var(--rule); padding: 4px 6px; letter-spacing: 0.12em;
+}
+select#policy.playing { border-color: var(--good); color: var(--good); }
 .wrow { display: flex; gap: 26px; flex-wrap: wrap; align-items: flex-end; margin-bottom: 8px; }
 .chip { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; letter-spacing: 0.1em; }
 .chip .dot { width: 8px; height: 8px; border-radius: 50%; }
@@ -171,6 +176,7 @@ main {
   <div class="kv"><span class="k">gradient updates</span><span class="v" id="h-upd">—</span></div>
   <div class="spacer"></div>
   <span class="chip" id="h-link"><span class="dot"></span><span>—</span></span>
+  <select id="policy" hidden title="Run a saved policy instead of training, or go back to training"></select>
   <button id="pause-robot" class="pause" type="button" hidden title="Hold the wheels, or let the policy drive them">PAUSE ROBOT</button>
   <button id="pause-train" class="pause" type="button" hidden title="Stop or start the learner's updates">PAUSE TRAINING</button>
   <button id="restart" type="button" hidden title="Start training again from random weights">RESTART TRAINING</button>
@@ -388,6 +394,7 @@ function onState(s) {
   if (s.t0) t0 = s.t0;
   if (s.train_started !== undefined) { trainStarted = s.train_started; waiting = !!s.waiting; }
   showPause(s);
+  showPolicy(s);
   // one reward per state frame is a sample of the stream, not every step:
   // the per-second bins come from the phone's /history, which sees them all.
   const stepped = s.step !== lastStep; lastStep = s.step;
@@ -462,6 +469,41 @@ async function sendPause(btn, key) {
 pauseRobotBtn.onclick = () => sendPause(pauseRobotBtn, 'robot');
 pauseTrainBtn.onclick = () => sendPause(pauseTrainBtn, 'training');
 
+// ---------- policy ----------
+// TRAINING, or a saved policy run on the phone in its place (the trainer
+// waits; choosing TRAINING reconnects to it). A phone started from the
+// Dreamer Player has no training to go back to and lists only policies.
+const policySel = document.getElementById('policy');
+let policyNames = '', policySent = null, policyAt = 0;
+function showPolicy(s) {
+  if (!Array.isArray(s.policies)) return;
+  const names = (s.can_train ? [''] : []).concat(s.policies);
+  if (s.playing && !names.includes(s.playing)) names.push(s.playing);
+  const key = names.join('\n');
+  if (key !== policyNames) {
+    policyNames = key;
+    policySel.replaceChildren(...names.map(n => {
+      const o = document.createElement('option');
+      o.value = n; o.textContent = n ? 'PLAY ' + n : 'TRAINING';
+      return o;
+    }));
+  }
+  policySel.hidden = names.length < 2 && !s.playing;
+  const now = s.playing || '';
+  if (policySent !== null && policySent !== now && performance.now() - policyAt < 5000) return;
+  policySent = null; policySel.disabled = false;
+  policySel.value = now;
+  policySel.classList.toggle('playing', !!s.playing);
+}
+policySel.onchange = async () => {
+  const name = policySel.value || null;
+  policySent = policySel.value; policyAt = performance.now(); policySel.disabled = true;
+  try {
+    if (socket && socket.readyState === 1) socket.send(JSON.stringify({t: 'play', name}));
+    else if (!(await fetch('/play', {method: 'POST', body: JSON.stringify({name})})).ok) throw new Error();
+  } catch (e) { policySent = null; policySel.disabled = false; }
+};
+
 // ---------- restart ----------
 // Offered only by a trainer started with tools/robot/demo.sh. Two presses, so
 // a stray click cannot throw a run away; the page resets itself when the
@@ -470,7 +512,9 @@ const restartBtn = document.getElementById('restart');
 let restartArmed = null, restarting = null;
 function showRestart(s) {
   restartBtn.hidden = !(s.can_restart || restarting);
-  if (restarting && performance.now() - restarting > 30000) {
+  // The trainer keeps the current run until the next one is ready, up to
+  // ~1.5 min after the previous restart on Saion.
+  if (restarting && performance.now() - restarting > 180000) {
     restartDone(); restartBtn.textContent = 'RESTART FAILED';
   }
 }
@@ -842,7 +886,7 @@ function drawBlueprint() {
 // ---------- header ----------
 function drawHeader() {
   const s = lastState || {};
-  $('h-run').textContent = run || '—';
+  $('h-run').textContent = s.playing ? 'playing ' + s.playing : run || '—';
   $('h-time').textContent = !(t0 && run) ? '—' : waiting ? 'not started'
     : fmtTime(phoneNow() - origin()) + (s.train_paused ? ' · paused' : '');
   $('h-hz').textContent = s.hz ? `${s.hz.toFixed(0)} Hz` : '—';

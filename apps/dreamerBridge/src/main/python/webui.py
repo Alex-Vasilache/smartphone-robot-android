@@ -18,6 +18,8 @@ a live blueprint of the robot.
     POST /restart     train from scratch (a tools/robot/demo.sh trainer only)
     POST /pause       {"robot": bool} and/or {"training": bool}: pause (true)
                       or start the robot's wheels or the learner
+    POST /play        {"name": str}: play that saved policy instead of
+                      training; {"name": null}: back to training
 
 The page talks over one WebSocket. Polling plain HTTP was measured at ~110 ms
 (p50) from a posted command to the page seeing it, up to ~250 ms: a fresh TCP
@@ -108,12 +110,13 @@ class _Client:
 class WebUI:
 
     def __init__(self, commands, port=PORT, history=None, on_restart=None,
-                 on_pause=None):
+                 on_pause=None, on_play=None):
         self.commands = commands
         self.port = port
         self.history = history or dict  # () -> the run's history as a dict
         self.on_restart = on_restart    # () -> None; raises if not offered
         self.on_pause = on_pause        # (robot, training) -> None; likewise
+        self.on_play = on_play          # (name or None) -> None; likewise
         self.state = {}   # the latest published, never mutated
         self.page = pkgutil.get_data('webpages', 'index.html')
         self.dash = pkgutil.get_data('webpages', 'dashboard.html')
@@ -170,6 +173,10 @@ class WebUI:
             if self.on_pause is None:
                 raise ValueError('pausing is not available')
             self.on_pause(message.get('robot'), message.get('training'))
+        elif kind == 'play':
+            if self.on_play is None:
+                raise ValueError('choosing a policy is not available')
+            self.on_play(message.get('name') or None)
         else:
             raise ValueError('unknown message %r' % kind)
 
@@ -223,6 +230,8 @@ class WebUI:
                         ui.handle(dict(t='restart'))
                     elif path == '/pause':
                         ui.handle(dict(body, t='pause'))
+                    elif path == '/play':
+                        ui.handle(dict(body, t='play'))
                     else:
                         return self._send(404, b'not found', 'text/plain')
                     self._json(dict(ok=True))

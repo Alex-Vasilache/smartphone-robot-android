@@ -331,6 +331,15 @@ robot_paused = False
 train_paused = False
 pause_lock = threading.Lock()
 pause_asked = {}   # web thread -> control loop: {'robot'/'training': bool}
+# Playing a saved policy instead of training, chosen on the dashboard: the
+# trainer is let go (its env waits for us, as after any lost link), the policy
+# runs as in the Dreamer Player, and choosing training again reconnects on the
+# training weights. The web thread asks; the control loop switches between
+# steps. `training_saved` holds what the player replaced while it plays.
+play_lock = threading.Lock()
+play_asked = []    # [name], or [None] for back to training
+training_saved = None
+policy_list = [0.0, []]   # [monotonic time listed, names], for web_state
 # This run's reward curve, weight updates and learner metrics, for the web
 # dashboard (dashboard.py); the live numbers come from web_state.
 history = dashboard.RunHistory()
@@ -405,12 +414,13 @@ def setup():
             print('dreamerBridge: could not pin the control thread: %s' % e)
     global web, web_url
     web = webui.WebUI(commands, history=history.snapshot,
-                      on_restart=request_restart, on_pause=request_pause)
+                      on_restart=request_restart, on_pause=request_pause,
+                      on_play=request_play)
     web_url = web.start() or ''
     load_reward_settings()
     from policy_runner import PolicyRunner
     if player_policy:
-        setup_player(PolicyRunner)
+        setup_player(PolicyRunner, str(player_policy))
     else:
         runner = PolicyRunner(boot_policy())
     print('dreamerBridge: onboard policy %s' % (
@@ -465,20 +475,21 @@ def setup():
         settings['ip'], settings['port']))
 
 
-def setup_player(PolicyRunner):
-    """Load the chosen policy and its settings; no trainer will connect."""
+def setup_player(PolicyRunner, path):
+    """Load the chosen policy and its settings; no trainer will connect.
+    Nothing changes if the weights do not load."""
     global runner, player, onboard, max_hz, cmd_scale, pace
-    path = str(player_policy)
     side = os.path.splitext(path)[0] + '.json'
-    player = dict(name=os.path.basename(os.path.splitext(path)[0]), hz=MAX_HZ,
+    chosen = dict(name=os.path.basename(os.path.splitext(path)[0]), hz=MAX_HZ,
                   length=500, command_scale=1.0)
     try:
         with open(side) as f:
-            player.update(json.load(f))
+            chosen.update(json.load(f))
     except Exception as e:  # noqa: BLE001 -- run on defaults rather than not at all
         print('dreamerBridge: no settings for %s (%s); using defaults' % (path, e))
-    runner = PolicyRunner()
-    runner.load_path(path, stamp=player['name'])
+    loaded = PolicyRunner()
+    loaded.load_path(path, stamp=chosen['name'])
+    player, runner = chosen, loaded
     runner.mode = 'eval' if player_eval else 'train'
     # `onboard` turns on the warm-up before each step, as when training.
     onboard = True
@@ -696,6 +707,8 @@ def loop():
     """One control step, or one reconnect attempt if we are not connected."""
     global step, next_tick, last_act
     global direct_out, direct_at
+    if play_asked:
+        switch_policy()
     if commands.settings['mode'] == 'direct':
         return loop_direct()
     direct_out, direct_at = (0.0, 0.0), 0.0
@@ -919,7 +932,9 @@ def note_reward(reward):
     reward_avg += REWARD_AVG_ALPHA * (reward - reward_avg)
     ep_return += reward
     ep_steps += 1
-    history.reward(reward)
+    if training_saved is None:
+        # A policy played in the middle of training is not part of its curve.
+        history.reward(reward)
     gui = context.guiUpdater
     gui.setReward(reward)
     gui.setRewardAvg(reward_avg)
@@ -1015,6 +1030,8 @@ def web_state():
         can_restart=bool(trainer_restart and sock is not None and onboard),
         holding=hold_weights,
         can_pause=bool(can_pause and sock is not None),
+        playing=player['name'] if player is not None else None,
+        policies=policy_names(), can_train=not player_policy,
         robot_paused=robot_paused, train_paused=train_paused,
         train_started=history.train_started, waiting=history.waiting,
         grid=0.0 if commands.settings['mode'] == 'blend'
@@ -1266,6 +1283,80 @@ def send_restart():
     reward_avg = 0.0
     print('dreamerBridge: asked the trainer for a fresh run')
     context.guiUpdater.setTrainerStatus('restarting training')
+
+
+def policy_names():
+    """The saved policies, as the dashboard lists them; the directory is read
+    at most every 2 s."""
+    now = time.monotonic()
+    if now - policy_list[0] >= 2.0:
+        try:
+            names = sorted(os.path.splitext(f)[0]
+                           for f in os.listdir(policies_dir())
+                           if f.endswith('.npz'))
+        except OSError:
+            names = []
+        policy_list[:] = [now, names]
+    return policy_list[1]
+
+
+def request_play(name):
+    """From the web page's thread: play the saved policy `name`, or go back
+    to training (None). The control loop makes the switch."""
+    if name is None:
+        if player_policy:
+            raise ValueError('started from the Dreamer Player: no training '
+                             'to go back to')
+    elif not os.path.exists(os.path.join(policies_dir(), name + '.npz')):
+        raise ValueError('no saved policy %r' % name)
+    with play_lock:
+        play_asked[:] = [name]
+
+
+def switch_policy():
+    """Between two steps: start the policy the dashboard chose, or go back to
+    training on the weights it had."""
+    global player, runner, onboard, standalone, max_hz, cmd_scale, pace
+    global command_bias, friction_comp, training_saved, step, prev_act
+    global last_attempt, hold_weights
+    with play_lock:
+        if not play_asked:
+            return
+        name = play_asked.pop()
+    if name is None and training_saved is None:
+        return
+    if name is not None and player is not None and name == player['name']:
+        return
+    stop_wheels()
+    end_episode()
+    step = 0
+    prev_act = (0.0, 0.0)
+    if name is None:
+        saved, training_saved = training_saved, None
+        (player, runner, onboard, standalone, max_hz, cmd_scale, pace,
+         command_bias, friction_comp, hold_weights) = saved['state']
+        commands.set_mode(saved['mode'])
+        if runner is not None:
+            runner.reset()
+        last_attempt = 0.0   # reconnect on the next step
+        print('dreamerBridge: back to training')
+        context.guiUpdater.setTrainerStatus('back to training: connecting')
+        return
+    state = (player, runner, onboard, standalone, max_hz, cmd_scale, pace,
+             command_bias, friction_comp, hold_weights)
+    mode = commands.settings['mode']
+    from policy_runner import PolicyRunner
+    try:
+        setup_player(PolicyRunner, os.path.join(policies_dir(), name + '.npz'))
+    except Exception as e:  # noqa: BLE001 -- keep doing what we were doing
+        print('dreamerBridge: cannot play %s: %s' % (name, e))
+        return
+    if training_saved is None and not player_policy:
+        training_saved = dict(state=state, mode=mode)
+        # Let the trainer go; it waits for the reconnect.
+        disconnect()
+        restart_asked.clear()
+    context.guiUpdater.setTrainerStatus('playing %s' % player['name'])
 
 
 def request_pause(robot=None, training=None):
