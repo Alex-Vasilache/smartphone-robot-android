@@ -6,29 +6,33 @@
 <meta name="theme-color" content="#1a1a19">
 <title>Robot Joystick</title>
 <style>
-  /* Dark by default; light with the THEME button, ?theme=light, or the
-     choice made on /dash (both pages keep it under one key). */
+  /* The dashboard's palette (dashboard.html): blueprint navy, or paper with
+     the THEME button, ?theme=light, or the choice made on /dash (both pages
+     keep it under one key). */
   :root {
     color-scheme: dark;
-    --surface: #1a1a19; --raised: #242422; --track: #383835; --zero: #8a8985;
-    --ink: #ffffff; --ink2: #c3c2b7; --ink3: #8a8985;
-    --blue: #6a9fd8; --red: #d98080; --yellow: #d9b45a;
-    --blue-tint: #6a9fd822; --knob: #c3c2b799; --knob-held: #ffffffaa;
-    --shadow: #000a; --strip: #ffffff99; --status: #707070;
+    --surface: #04101d; --raised: #071526; --track: #16324f; --zero: #57789a;
+    --ink: #dcefff; --ink2: #93b7d6; --ink3: #57789a;
+    --blue: #3594e0; --red: #d03b3b; --yellow: #fab219;
+    --blue-tint: rgba(53, 148, 224, 0.15); --knob: rgba(140, 207, 255, 0.35);
+    --knob-held: rgba(140, 207, 255, 0.65); --shadow: rgba(0, 0, 0, 0.6);
+    --strip: rgba(220, 239, 255, 0.6); --status: #57789a;
     --mono: ui-monospace, "SF Mono", Menlo, "Roboto Mono", monospace;
   }
   :root[data-theme="light"] {
     color-scheme: light;
-    --surface: #f4f4f1; --raised: #ffffff; --track: #d9d8d2; --zero: #8a8985;
-    --ink: #1a1a19; --ink2: #3d3d3a; --ink3: #75746f;
-    --blue: #2f6db5; --red: #c04545; --yellow: #a87a12;
-    --blue-tint: #2f6db51a; --knob: #3d3d3a66; --knob-held: #1a1a19aa;
-    --shadow: #0003; --strip: #ffffffcc; --status: #75746f;
+    --surface: #eef3f9; --raised: #f8fbfe; --track: #cddcec; --zero: #7890ab;
+    --ink: #0c2340; --ink2: #3d5a7c; --ink3: #7890ab;
+    --blue: #1d63c9; --red: #d03b3b; --yellow: #c98a00;
+    --blue-tint: rgba(29, 99, 201, 0.10); --knob: rgba(29, 99, 201, 0.25);
+    --knob-held: rgba(29, 99, 201, 0.5); --shadow: rgba(12, 35, 64, 0.25);
+    --strip: rgba(255, 255, 255, 0.8); --status: #7890ab;
   }
   * { box-sizing: border-box; }
   html, body { margin: 0; height: 100%; height: 100dvh; overflow: hidden; background: var(--surface); color: var(--ink);
     font-family: var(--mono); -webkit-tap-highlight-color: transparent; }
-  body { display: flex; flex-direction: column; overscroll-behavior: none; }
+  body { display: flex; flex-direction: column; overscroll-behavior: none;
+    user-select: none; -webkit-user-select: none; }
   /* In the dashboard's column: dvh there can be the whole window's. */
   html.embed, html.embed body { height: 100%; }
   header { display: flex; align-items: center; gap: 8px; padding: 10px 16px 6px; }
@@ -194,6 +198,8 @@
   try { t = localStorage.getItem('dash-theme'); } catch (e) {}
   const q = new URLSearchParams(location.search).get('theme');
   if (q === 'dark' || q === 'light') t = q;
+  // No choice made: the system's, as /dash does.
+  if (!t) t = matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
   apply(t);
   // Inside the dashboard, which sets the theme for both.
   if (new URLSearchParams(location.search).has('embed')) {
@@ -308,6 +314,7 @@ function fromEvent(e) {
   return { forward: +shape(y).toFixed(3), turn: +shape(x).toFixed(3) };
 }
 pad.addEventListener("pointerdown", e => {
+  e.preventDefault();   // a mouse drag would otherwise select text
   pad.setPointerCapture(e.pointerId);
   pad.classList.add("held");
   stick = fromEvent(e); place(knob, stick.forward, stick.turn); send();
