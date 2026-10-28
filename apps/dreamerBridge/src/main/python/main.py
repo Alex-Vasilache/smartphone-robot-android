@@ -339,6 +339,16 @@ pause_asked = {}   # web thread -> control loop: {'robot'/'training': bool}
 play_lock = threading.Lock()
 play_asked = []    # [name], or [None] for back to training
 training_saved = None
+# Every step a saved policy drives is written to recordings/<name>_<time>.csv
+# (tools/robot/pull_recordings.sh), so a policy can be measured on the robot
+# without a trainer. `last_sent` is what the base was last told, after
+# zero_fix.
+recording = None   # the open file while a saved policy plays
+last_sent = (0.0, 0.0)
+RECORD_COLUMNS = ('t_obs', 't_drive', 'step', 'theta', 'angular_velocity',
+                  'wheel_speed_l', 'wheel_speed_r', 'act_l', 'act_r', 'req_l',
+                  'req_r', 'sent_l', 'sent_r', 'cmd_f', 'cmd_t', 'reward',
+                  'battery_voltage')
 policy_list = [0.0, []]   # [monotonic time listed, names], for web_state
 # This run's reward curve, weight updates and learner metrics, for the web
 # dashboard (dashboard.py); the live numbers come from web_state.
@@ -505,6 +515,7 @@ def setup_player(PolicyRunner, path):
     pace = PACE
     print('dreamerBridge: player running %s at %g Hz (%s actions)' % (
         player['name'], max_hz, runner.mode))
+    start_recording(player['name'])
 
 
 def reward_settings_path():
@@ -632,10 +643,13 @@ def loop_player():
     global step, prev_act
     wait_for_pace()
     snap, _, _ = sample()
+    taken_at = time.monotonic()
     cmd = commands.tick()
     _, act = runner.act(snap, cmd)
     policy_drive(act[0], act[1])
-    note_reward(player_reward(snap, act, cmd))
+    reward = player_reward(snap, act, cmd)
+    note_reward(reward)
+    record_step(taken_at, snap, act, cmd, reward)
     step += 1
     if step >= int(player['length']):
         # Episodes as long as in training: the policy never saw a longer
@@ -647,6 +661,54 @@ def loop_player():
     if prepare_ahead:
         runner.prepare()
     update_gui()
+
+
+def start_recording(name):
+    global recording
+    stop_recording()
+    folder = os.path.join(str(context.getExternalFilesDir(None)), 'recordings')
+    try:
+        os.makedirs(folder, exist_ok=True)
+        path = os.path.join(folder, '%s_%s.csv' % (
+            name, time.strftime('%Y%m%d_%H%M%S')))
+        with open(path[:-4] + '.json', 'w') as f:
+            json.dump(dict(player, actions=runner.mode), f, indent=1)
+        recording = open(path, 'w')
+        recording.write(','.join(RECORD_COLUMNS) + '\n')
+        print('dreamerBridge: recording to %s' % path)
+    except Exception as e:  # noqa: BLE001 -- play anyway
+        recording = None
+        print('dreamerBridge: cannot record: %s' % e)
+
+
+def stop_recording():
+    global recording
+    if recording is not None:
+        try:
+            recording.close()
+        except Exception:  # noqa: BLE001
+            pass
+        recording = None
+
+
+def record_step(taken_at, snap, act, cmd, reward):
+    """One row: what the policy saw, chose and the base was sent. A held
+    robot (the screen's STOP) shows as sent 0 and is dropped later."""
+    if recording is None:
+        return
+    row = (taken_at, t_drive, step, snap['theta'], snap['angular_velocity'],
+           snap['wheel_speed_l'], snap['wheel_speed_r'], act[0], act[1],
+           last_command[0], last_command[1], last_sent[0], last_sent[1],
+           cmd[0], cmd[1], reward, snap.get('battery_voltage', 0.0))
+    try:
+        recording.write('%.4f,%.4f,' % row[:2]
+                        + ','.join('%.6g' % float(v) for v in row[2:]) + '\n')
+        # STOP kills the process: lose at most a second.
+        if step % 64 == 0:
+            recording.flush()
+    except Exception as e:  # noqa: BLE001 -- a full disk must not stop the robot
+        print('dreamerBridge: recording stopped: %s' % e)
+        stop_recording()
 
 
 def sample():
@@ -1325,6 +1387,7 @@ def switch_policy():
         return
     stop_wheels()
     end_episode()
+    stop_recording()
     step = 0
     prev_act = (0.0, 0.0)
     if name is None:
@@ -1650,6 +1713,7 @@ def drive(left, right, scale=None):
     on the actuation delay, not the whole of it -- see `ser_service_ms`.
     """
     global drive_ms, last_drive, cycle_ms, last_command, t_drive, t_dequeued
+    global last_sent
     # The policy acts in [-1, 1]; the trainer may cap the motors below full
     # power (env.robot.command_scale) without shrinking the policy's range.
     scale = cmd_scale if scale is None else scale
@@ -1675,6 +1739,7 @@ def drive(left, right, scale=None):
     if not no_base:
         context.outputs.setWheelOutput(left, right, lb, rb, float(slew_max))
     last_command = requested
+    last_sent = (0.0 if lb else left, 0.0 if rb else right)
     drive_ms = (time.monotonic() - t0) * 1e3
     cycle_ms = (t0 - last_drive) * 1e3 if last_drive else 0.0
     last_drive = t0
