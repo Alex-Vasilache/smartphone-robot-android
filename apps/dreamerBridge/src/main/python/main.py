@@ -1143,6 +1143,10 @@ def loop_onboard():
     applied = time.monotonic()
     last_act = applied
     seq += 1
+    # Scored here, from the trainer's settings, rather than taken from its
+    # reply: over a slow link (a trainer on another continent) the reply
+    # lands seconds after the step it scores.
+    note_reward(player_reward(snap, act, cmd))
 
     write(dict(type='obs', step=step, seq=seq, t=time.time(), fresh=True,
                pace=pace, cycle_ms=cycle_ms, lead_ms=wake_lead_ms,
@@ -1311,7 +1315,6 @@ def drain_control():
             apply_pause(header)
         elif kind in ('act', 'ctrl'):
             apply_overrides(header)
-            note_reward(float(header.get('reward', 0.0)))
             if header.get('reset'):
                 end_episode()
                 # The trainer owns episode boundaries; it is the side that
