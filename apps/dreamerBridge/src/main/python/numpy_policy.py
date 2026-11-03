@@ -20,6 +20,7 @@ this and the learner's own policy would show up only as a robot that acts
 subtly worse than its training curve claims.
 """
 
+import io
 import json
 
 import numpy as np
@@ -27,8 +28,52 @@ import numpy as np
 __all__ = ['NumpyPolicy']
 
 F32 = np.float32
-# Must match export.SCALE_SUFFIX; this file cannot import it (see above).
+# Must match export.SCALE_SUFFIX, DELTA_INT8 and DELTA_XOR; this file cannot
+# import them (see above).
 SCALE_SUFFIX = '.scale'
+DELTA_INT8 = '@d'
+DELTA_XOR = '@x'
+
+
+def read_npz(source):
+  """Every array of an .npz, from a path or from its bytes."""
+  if isinstance(source, (bytes, bytearray)):
+    source = io.BytesIO(source)
+  with np.load(source, allow_pickle=False) as data:
+    return {k: data[k] for k in data.files}
+
+
+def is_delta(blob):
+  """Whether pushed npz bytes are a delta (export.encode with a base)."""
+  with np.load(io.BytesIO(blob), allow_pickle=False) as data:
+    return '__base__' in data.files
+
+
+def expand_delta(blob, base_path):
+  """The full npz bytes a delta stands for, rebuilt from the push it names
+  as its base, which must be the one stored at `base_path`."""
+  delta = read_npz(blob)
+  base = read_npz(base_path)
+  want = str(delta['__base__'])
+  have = str(base['__stamp__']) if '__stamp__' in base else None
+  if want != have:
+    raise ValueError('delta built on %s, but %s holds %s'
+                     % (want, base_path, have))
+  out = {}
+  for k, v in delta.items():
+    if k == '__base__':
+      continue
+    if k.endswith(DELTA_INT8):
+      name = k[:-len(DELTA_INT8)]
+      out[name] = (base[name].view(np.uint8) + v).view(np.int8)
+    elif k.endswith(DELTA_XOR):
+      name = k[:-len(DELTA_XOR)]
+      out[name] = (base[name].view(np.uint16) ^ v).view(np.float16)
+    else:
+      out[k] = v
+  buffer = io.BytesIO()
+  np.savez(buffer, **out)
+  return buffer.getvalue()
 
 
 # --- primitives, matching embodied/jax/nets.py -----------------------------
@@ -111,7 +156,7 @@ class NumpyPolicy:
       meta = json.loads(str(data['__meta__'].item()))
       w = {}
       for k in data.files:
-        if k == '__meta__' or k.endswith(SCALE_SUFFIX):
+        if k.startswith('__') or k.endswith(SCALE_SUFFIX):
           continue
         v = np.asarray(data[k], F32)
         if k + SCALE_SUFFIX in data.files:

@@ -1175,6 +1175,7 @@ def loop_onboard():
                weights_installed=weights_installed,
                build_ms=receiver.last_build_ms if receiver else 0.0,
                sensors=snap,
+               **take_wtiming(),
                **latency_block(tick, snap_stamp, snap_age)))
     step += 1
     if restart_asked.is_set():
@@ -1287,6 +1288,35 @@ def record_split(wait, work):
     last_wait_ms, last_work_ms = wait, work
 
 
+# How the last weight push went on this side, sent once with the next
+# observation (`wtiming`) so the trainer can print where a push's time went:
+# recv_s first part to last, build_ms parsing (and rebuilding a delta),
+# install_ms waiting for the control loop to swap it in. `failed` instead
+# when it would not load, so the trainer sends the next push whole.
+wtiming = None
+
+
+def note_wtiming(stamp, header, failed=False):
+    global wtiming
+    if failed:
+        wtiming = dict(stamp=stamp, failed=True, error=header.get('error'))
+        return
+    ready = header.get('ready_at')
+    wtiming = dict(
+        stamp=stamp, recv_s=header.get('recv_s'), bytes=header.get('bytes'),
+        build_ms=round(float(header.get('build_ms', 0.0)), 1),
+        install_ms=round((time.monotonic() - ready) * 1e3, 1)
+        if ready else None)
+
+
+def take_wtiming():
+    global wtiming
+    if wtiming is None:
+        return {}
+    out, wtiming = dict(wtiming=wtiming), None
+    return out
+
+
 def drain_control():
     """Take whatever the trainer has sent, without blocking the control loop.
 
@@ -1306,10 +1336,13 @@ def drain_control():
         if kind == 'weights_ready':
             stamp = header.get('stamp')
             runner.install(payload, stamp)
+            note_wtiming(stamp, header)
             weights_installed += 1
             history.weights(stamp)
             hold_weights = False
             context.guiUpdater.setTrainerStatus('policy %s' % stamp)
+        elif kind == 'weights_failed':
+            note_wtiming(header.get('stamp'), header, failed=True)
         elif kind == 'stats':
             # The learner's latest metrics, forwarded by the trainer for the
             # web dashboard only.
@@ -1807,7 +1840,10 @@ def connect():
                    # We reassemble weight pushes sent in slices, and take
                    # them over connections of their own (bridge_link.
                    # WeightStreams) from a trainer that offers them.
-                   wchunk=True, wstreams=True))
+                   wchunk=True, wstreams=True,
+                   # We rebuild delta pushes on the weights we hold
+                   # (policy_runner.build_blob).
+                   wdelta=True))
         hello = read()
         if hello['type'] != 'hello' or hello['protocol'] != PROTOCOL:
             raise ValueError('Unexpected handshake %r' % hello)

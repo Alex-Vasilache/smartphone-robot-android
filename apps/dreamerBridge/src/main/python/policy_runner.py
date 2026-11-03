@@ -20,7 +20,7 @@ import time
 
 import numpy as np
 
-from numpy_policy import NumpyPolicy  # noqa: E402  (flat layout on the phone)
+from numpy_policy import NumpyPolicy, expand_delta, is_delta  # noqa: E402  (flat layout on the phone)
 
 __all__ = ['PolicyRunner']
 
@@ -80,7 +80,13 @@ class PolicyRunner:
 
     Touches nothing the control loop reads, so it can run on any thread (see
     bridge_link.Receiver); `install` the result on the control thread.
+
+    A delta push (export.encode with a base) is rebuilt first from the push
+    stored at `path`, which it must name as its base; otherwise this raises
+    and the trainer, told so, sends the next push whole.
     """
+    if is_delta(blob):
+      blob = expand_delta(blob, path)
     directory = os.path.dirname(path)
     os.makedirs(directory, exist_ok=True)
     fd, tmp = tempfile.mkstemp(suffix='.npz', dir=directory)

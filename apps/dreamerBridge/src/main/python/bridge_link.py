@@ -137,11 +137,14 @@ class Receiver:
       payload = self.build(blob, header) if self.build else blob
     except Exception as e:  # noqa: BLE001 -- a bad push must not end the link
       print('dreamerBridge: bad weight update %s: %s' % (header.get('stamp'), e))
+      # The control loop tells the trainer, which then sends the next push
+      # whole instead of as a delta on weights we do not hold.
+      self._put((dict(header, type='weights_failed', error=str(e)[:200]), b''))
       return
     self.last_build_ms = (time.monotonic() - t0) * 1e3
     self.weights_received += 1
-    self._put((dict(header, type='weights_ready', build_ms=self.last_build_ms),
-               payload))
+    self._put((dict(header, type='weights_ready', build_ms=self.last_build_ms,
+                    ready_at=time.monotonic()), payload))
 
 
 class WeightStreams:
@@ -166,7 +169,7 @@ class WeightStreams:
     self.up = 0
     self.parts_received = 0
     self._lock = threading.Lock()
-    self._push = None    # [(stamp, parts, total), bytearray, set(parts)]
+    self._push = None    # [(stamp, parts, total), bytearray, set(parts), t0]
     self._socks = set()
     self._closed = False
     for i, address in enumerate(self.addresses):
@@ -245,7 +248,7 @@ class WeightStreams:
       if self._push is None or self._push[0] != key:
         # A new push replaces whatever was half-joined: only the newest
         # weights matter, and a retry of the same push may split differently.
-        self._push = [key, bytearray(key[2]), set()]
+        self._push = [key, bytearray(key[2]), set(), time.monotonic()]
       push = self._push
       push[1][offset:offset + len(blob)] = blob
       push[2].add(int(header['part']))
@@ -253,7 +256,10 @@ class WeightStreams:
       if len(push[2]) < key[1]:
         return
       self._push = None
-    self.deliver(dict(type='weights', stamp=key[0]), bytes(push[1]))
+    # recv_s: first part to last, the part of a push the network decides.
+    self.deliver(dict(type='weights', stamp=key[0], parts=key[1], bytes=key[2],
+                      recv_s=round(time.monotonic() - push[3], 3)),
+                 bytes(push[1]))
 
 
 def parse(buffer):
