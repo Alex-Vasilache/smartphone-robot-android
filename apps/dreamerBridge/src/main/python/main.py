@@ -256,6 +256,9 @@ sock = None
 # that reads it and parses pushed weights so the control loop never does.
 buffer = bytearray()
 receiver = None
+# The trainer's weight-push connections (bridge_link.WeightStreams), if it
+# offered them in its hello; closed with the control socket.
+wstreams = None
 # No base on the phone: no serial link and no wheels. Everything else -- the
 # sensors, the policy, the trainer link and the pacing -- runs as on the robot,
 # which is what makes it a test of the link at a given rate. Set with
@@ -1801,8 +1804,10 @@ def connect():
                    robot_id=ROBOT_ID, onboard=bool(runner and runner.ready),
                    policy_stamp=(runner.stamp if runner else None),
                    pace=PACE, max_hz=float(settings['max_hz']),
-                   # We reassemble weight pushes sent in slices.
-                   wchunk=True))
+                   # We reassemble weight pushes sent in slices, and take
+                   # them over connections of their own (bridge_link.
+                   # WeightStreams) from a trainer that offers them.
+                   wchunk=True, wstreams=True))
         hello = read()
         if hello['type'] != 'hello' or hello['protocol'] != PROTOCOL:
             raise ValueError('Unexpected handshake %r' % hello)
@@ -1857,6 +1862,17 @@ def connect():
             sock, build=weight_saver(hello.get('run'), hello.get('settings')),
             initial=bytes(buffer), timeout=RECV_TIMEOUT)
         buffer.clear()
+        # Weight pushes over connections of their own: to trainer.json's
+        # `wports` when it lists them (a relay's local ports, one ssh
+        # connection each), else `n` times to the trainer's stream port.
+        global wstreams
+        ws = hello.get('wstreams')
+        if ws:
+            ports = settings.get('wports') or [ws['port']] * int(ws['n'])
+            wstreams = bridge_link.WeightStreams(
+                [(address[0], int(p)) for p in ports], ws['session'],
+                receiver.deliver_weights)
+            mode += ', weights over %d streams' % len(ports)
         if no_base:
             mode += ', no base'
         print('dreamerBridge: connected to %s:%d (%s)' % (address + (mode,)))
@@ -1869,7 +1885,10 @@ def connect():
 
 
 def disconnect():
-    global sock, receiver
+    global sock, receiver, wstreams
+    if wstreams is not None:
+        wstreams.close()
+        wstreams = None
     if receiver is not None:
         receiver.close()
         receiver = None

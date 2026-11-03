@@ -27,6 +27,8 @@ import numpy as np
 __all__ = ['NumpyPolicy']
 
 F32 = np.float32
+# Must match export.SCALE_SUFFIX; this file cannot import it (see above).
+SCALE_SUFFIX = '.scale'
 
 
 # --- primitives, matching embodied/jax/nets.py -----------------------------
@@ -107,7 +109,16 @@ class NumpyPolicy:
     stays valid because only the parameters change, not the state layout."""
     with np.load(path, allow_pickle=False) as data:
       meta = json.loads(str(data['__meta__'].item()))
-      w = {k: np.asarray(data[k], F32) for k in data.files if k != '__meta__'}
+      w = {}
+      for k in data.files:
+        if k == '__meta__' or k.endswith(SCALE_SUFFIX):
+          continue
+        v = np.asarray(data[k], F32)
+        if k + SCALE_SUFFIX in data.files:
+          # int8 codes with one scale per output channel (export.py,
+          # weights_dtype int8); dequantized once here, not per step.
+          v = v * np.asarray(data[k + SCALE_SUFFIX], F32)
+        w[k] = v
     if self.meta and meta['signature'] != self.meta['signature']:
       raise ValueError(
           'Refusing to load weights with a different architecture: '

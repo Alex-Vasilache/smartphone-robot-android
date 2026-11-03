@@ -10,7 +10,10 @@ cost of an assignment.
 
 Pushes arrive either whole (`weights`, the old trainer) or in slices
 (`wchunk`, with `offset` and `total`), which let the trainer slip its control
-frames in between; this side reassembles either.
+frames in between; this side reassembles either. A trainer that offers
+`wstreams` in its hello sends them instead over connections of their own
+(`WeightStreams`), one part per connection, so a long-distance link carries a
+push several times faster and the control link never waits behind one.
 
 Pure standard library plus whatever `build` needs, so the same file runs in the
 app and in the dreamerv3 repo's fake phone (`dreamerv3/deploy/bridge_link.py`
@@ -71,6 +74,11 @@ class Receiver:
 
   def close(self):
     self._closed = True
+
+  def deliver_weights(self, header, blob):
+    """A whole push that came some other way (WeightStreams): build it and
+    hand it to the control loop as if it had come over this socket."""
+    self._weights(header, blob)
 
   def _put(self, frame):
     with self._ready:
@@ -134,6 +142,118 @@ class Receiver:
     self.weights_received += 1
     self._put((dict(header, type='weights_ready', build_ms=self.last_build_ms),
                payload))
+
+
+class WeightStreams:
+  """The connections a trainer pushes weights over (its hello's `wstreams`).
+
+  One thread per address connects, greets with the session token, and reads
+  `wpart` frames; the parts of one push are joined here and the whole goes to
+  `deliver(header, blob)` once every part has landed. A lost connection is
+  retried every few seconds until `close`; the trainer pushes over the ones
+  that are up (or over the control link while none are).
+  """
+
+  RETRY_S = 5.0
+
+  def __init__(self, addresses, session, deliver, connect_timeout=10.0,
+               protocol=3):
+    self.addresses = list(addresses)
+    self.session = session
+    self.deliver = deliver
+    self.connect_timeout = connect_timeout
+    self.protocol = protocol
+    self.up = 0
+    self.parts_received = 0
+    self._lock = threading.Lock()
+    self._push = None    # [(stamp, parts, total), bytearray, set(parts)]
+    self._socks = set()
+    self._closed = False
+    for i, address in enumerate(self.addresses):
+      threading.Thread(target=self._run, args=(i, address),
+                       name='bridge_wstream%d' % i, daemon=True).start()
+
+  @property
+  def receiving(self):
+    return self._push is not None
+
+  def close(self):
+    self._closed = True
+    with self._lock:
+      socks = list(self._socks)
+    for sock in socks:
+      try:
+        sock.shutdown(socket.SHUT_RDWR)
+      except OSError:
+        pass
+      try:
+        sock.close()
+      except OSError:
+        pass
+
+  def _run(self, index, address):
+    while not self._closed:
+      sock = None
+      try:
+        sock = socket.create_connection(address, timeout=self.connect_timeout)
+        sock.settimeout(None)  # quiet between pushes for as long as it likes
+        with self._lock:
+          self._socks.add(sock)
+        hello = json.dumps(dict(
+            type='wstream', protocol=self.protocol, session=self.session,
+            index=index, blob_len=0)).encode('utf-8')
+        sock.sendall(struct.pack('>I', len(hello)) + hello)
+        self.up += 1
+        try:
+          self._read(sock)
+        finally:
+          self.up -= 1
+      except Exception as e:  # noqa: BLE001 -- retried below
+        if not self._closed:
+          print('dreamerBridge: weight stream %d to %s:%d: %s'
+                % ((index,) + tuple(address) + (e,)))
+      finally:
+        if sock is not None:
+          with self._lock:
+            self._socks.discard(sock)
+          try:
+            sock.close()
+          except OSError:
+            pass
+      deadline = time.monotonic() + self.RETRY_S
+      while not self._closed and time.monotonic() < deadline:
+        time.sleep(0.2)
+
+  def _read(self, sock):
+    buffer = bytearray()
+    while not self._closed:
+      chunk = sock.recv(1 << 16)
+      if not chunk:
+        raise ConnectionError('trainer closed the stream')
+      buffer.extend(chunk)
+      while True:
+        frame = parse(buffer)
+        if frame is None:
+          break
+        if frame[0].get('type') == 'wpart':
+          self._part(*frame)
+
+  def _part(self, header, blob):
+    key = (header.get('stamp'), int(header['parts']), int(header['total']))
+    offset = int(header['offset'])
+    with self._lock:
+      if self._push is None or self._push[0] != key:
+        # A new push replaces whatever was half-joined: only the newest
+        # weights matter, and a retry of the same push may split differently.
+        self._push = [key, bytearray(key[2]), set()]
+      push = self._push
+      push[1][offset:offset + len(blob)] = blob
+      push[2].add(int(header['part']))
+      self.parts_received += 1
+      if len(push[2]) < key[1]:
+        return
+      self._push = None
+    self.deliver(dict(type='weights', stamp=key[0]), bytes(push[1]))
 
 
 def parse(buffer):
