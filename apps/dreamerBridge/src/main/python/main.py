@@ -331,10 +331,13 @@ hold_weights = False
 # applied here the moment it is asked for, so the wheels stop at once.
 can_pause = False
 robot_paused = False
-# The trainer's speed cap: every onboard wheel command is clipped to
-# [-drive_cap, drive_cap]. Sent in its 'pause' frames; 1 at each new trainer.
-drive_cap = 1.0
 train_paused = False
+# Live training aids from the trainer (embodied/envs/robot.py): a cap on
+# every wheel command for its first minutes ('drive_cap' in a pause frame),
+# and between episodes a drive it asks for itself ('drive' in a ctrl frame:
+# the return home). Both reset at every new trainer connection.
+drive_cap = 1.0
+trainer_drive = None
 pause_lock = threading.Lock()
 pause_asked = {}   # web thread -> control loop: {'robot'/'training': bool}
 # Playing a saved policy instead of training, chosen on the dashboard: the
@@ -1140,8 +1143,12 @@ def loop_onboard():
         snap, snap_stamp, snap_age = sample()
         cmd = commands.tick()
         obs, act = runner.act(snap, cmd)
-    # The trainer's speed cap; what is driven and sent back is the clipped act.
-    act = [max(-drive_cap, min(drive_cap, a)) for a in act]
+    if trainer_drive is not None:
+        # Between episodes the trainer drives (the return home).
+        act = [float(trainer_drive[0]), float(trainer_drive[1])]
+    elif drive_cap < 1.0:
+        # Clipped, and recorded as clipped: what the wheels were given.
+        act = [max(-drive_cap, min(drive_cap, float(a))) for a in act]
     if hold_weights or robot_paused:
         # Recorded as what it is: a step with the wheels held.
         act = [0.0, 0.0]
@@ -1687,7 +1694,9 @@ def wait_for_tick():
 
 def apply_overrides(header):
     """Per-frame knobs the trainer may set, mostly for experiments."""
-    global slew_max, zero_mode, wake_lead_ms, spin_wait
+    global slew_max, zero_mode, wake_lead_ms, spin_wait, trainer_drive
+    # Only the frame that carries it drives; the next one without clears it.
+    trainer_drive = header.get('drive')
     if 'spin' in header:
         spin_wait = bool(header['spin'])
     if 'warm' in header:
@@ -1860,8 +1869,9 @@ def connect():
         # actions rather than send its own.
         global onboard, standalone, pace
         pace = hello.get('pace', PACE)
-        global cmd_scale
+        global cmd_scale, drive_cap, trainer_drive
         cmd_scale = float(hello.get('cmd_scale', 1.0))
+        drive_cap, trainer_drive = 1.0, None
         global command_bias, friction_comp
         command_bias = float(hello.get('command_bias', 0.0))
         friction_comp = bool(hello.get('friction_comp', False))
@@ -1882,8 +1892,6 @@ def connect():
         can_pause = hello.get('pause') is not None
         with pause_lock:
             pause_asked.clear()
-        global drive_cap
-        drive_cap = 1.0
         apply_pause(hello.get('pause'))
         max_hz = float(hello.get('max_hz', settings['max_hz']))
         if pace not in ('serial', 'clock'):
