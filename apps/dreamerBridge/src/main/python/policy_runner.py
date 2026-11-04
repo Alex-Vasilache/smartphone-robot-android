@@ -46,6 +46,10 @@ class PolicyRunner:
     # distribution's mode, for running a finished policy (the player).
     self.mode = 'train'
     self.prepared = 0     # steps that used a prepared half
+    # The leaky wheel distance of a policy that observes 'position'; kept
+    # across episodes and weight swaps, as the trainer keeps its own.
+    self.pos = np.zeros(2, np.float64)
+    self.prev_dist = None
     if path and os.path.exists(path):
       self.load_path(path, stamp='initial')
 
@@ -137,6 +141,17 @@ class PolicyRunner:
     if 'command' in self.policy.meta['obs_keys']:
       obs['command'] = np.clip(np.asarray(
           command if command is not None else (0.0, 0.0), np.float32), -1, 1)
+    if 'position' in self.policy.meta['obs_keys']:
+      # Mirrors robot.py:track_position, one step per observation.
+      dist = np.array([float(sensors.get('wheel_distance_l', 0.0)),
+                       float(sensors.get('wheel_distance_r', 0.0))])
+      step = (np.zeros(2) if self.prev_dist is None
+              else dist - self.prev_dist)
+      step[np.abs(step) > s['pos_jump']] = 0.0
+      self.pos = self.pos * np.exp(-1.0 / (s['pos_tau'] * s['hz'])) + step
+      self.prev_dist = dist
+      obs['position'] = np.clip(
+          self.pos * s['obs_pos_scale'], -clip, clip).astype(np.float32)
     return obs
 
   def prepare(self):
