@@ -434,7 +434,9 @@ def setup():
     global web, web_url
     web = webui.WebUI(commands, history=history.snapshot,
                       on_restart=request_restart, on_pause=request_pause,
-                      on_play=request_play)
+                      on_play=request_play,
+                      face_path=os.path.join(
+                          str(context.getExternalFilesDir(None)), 'face.html'))
     web_url = web.start() or ''
     load_reward_settings()
     from policy_runner import PolicyRunner
@@ -1000,6 +1002,9 @@ def note_reward(reward):
     """
     global reward_avg, ep_return, ep_steps, last_reward
     last_reward = reward
+    if runner is not None:
+        # The face's emotion (policy_runner.feel; weights with emotion heads).
+        runner.feel(reward)
     reward_avg += REWARD_AVG_ALPHA * (reward - reward_avg)
     ep_return += reward
     ep_steps += 1
@@ -1097,6 +1102,7 @@ def web_state():
         mode=commands.settings['mode'], measured=measured,
         run=history.run, t0=history.t0, now=time.time(),
         policy=str(runner.stamp) if runner is not None else None,
+        emotion=runner.emotion_state if runner is not None else None,
         weights_installed=weights_installed, stats=history.latest,
         can_restart=bool(trainer_restart and sock is not None and onboard),
         holding=hold_weights,
@@ -1136,6 +1142,7 @@ def loop_onboard():
         snap, snap_stamp, snap_age = sample()
         cmd = commands.tick()
         obs, act = runner.act(snap, cmd)
+        act = runner.limit(act)
         wait_for_serial()
     else:
         wait_for_pace()
@@ -1143,6 +1150,7 @@ def loop_onboard():
         snap, snap_stamp, snap_age = sample()
         cmd = commands.tick()
         obs, act = runner.act(snap, cmd)
+        act = runner.limit(act)
     if trainer_drive is not None:
         # Between episodes the trainer drives (the return home).
         act = [float(trainer_drive[0]), float(trainer_drive[1])]
@@ -1155,6 +1163,9 @@ def loop_onboard():
         stop_wheels()
     else:
         policy_drive(act[0], act[1])
+    # The policy's next step starts from what the wheels really got (held,
+    # clipped or the trainer's drive), as the trainer's replay records it.
+    runner.applied(act)
     applied = time.monotonic()
     last_act = applied
     seq += 1
@@ -1510,6 +1521,19 @@ def apply_pause(state):
     state = state or {}
     if state.get('drive_cap') is not None:
         drive_cap = min(1.0, max(0.0, float(state['drive_cap'])))
+    # A held command fades to 0 (policy_runner.Fatigue), as the trainer asks.
+    fat = state.get('fatigue') or {}
+    f = getattr(globals().get('runner'), 'fatigue', None)
+    if f is not None and (int(fat.get('steps', 0)), float(fat.get('tol', 0.15))) != (f.steps, f.tol):
+        f.set(int(fat.get('steps', 0)), fat.get('tol', 0.15), fat.get('dead', 0.05))
+        print('dreamerBridge: fatigue %d steps' % f.steps)
+    trav = state.get('travel') or {}
+    r = globals().get('runner')
+    if r is not None and hasattr(r, 'travel'):
+        t = (float(trav.get('lo', 0.0)), float(trav.get('hi', 0.0)))
+        if t != r.travel:
+            r.travel = t
+            print('dreamerBridge: travel limit %.0f..%.0f' % t)
     was = (robot_paused, train_paused)
     robot_paused = bool(state.get('robot', False))
     train_paused = bool(state.get('training', False))

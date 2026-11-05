@@ -1,0 +1,337 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Robot Face</title>
+<style>
+/* A full-screen face driven by the robot's valence (TD error), arousal
+   (novelty + unexpected surprise + reward error - empowerment) and
+   dominance (empowerment). Served by the phone at /face (live, over /ws),
+   or with ?trace=URL / an embedded window.FACE_TRACE it replays a recording. */
+:root { --bg: #10161c; --fg: #e8edf2; --muted: #8896a3; --panel: #18212a; }
+html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg);
+  font-family: "IBM Plex Sans", system-ui, sans-serif; overflow: hidden; }
+canvas { display: block; width: 100%; height: 100%; touch-action: none; }
+.hud { position: fixed; left: max(12px, env(safe-area-inset-left, 0px)); bottom: max(12px, env(safe-area-inset-bottom, 0px));
+  display: flex; gap: 10px; align-items: center; font: 12px "IBM Plex Mono", ui-monospace, monospace; color: var(--muted); flex-wrap: wrap; }
+.hud button { font: inherit; color: var(--fg); background: var(--panel); border: 1px solid #2c3a47; border-radius: 6px; padding: 6px 10px; cursor: pointer; }
+.hud button:focus-visible { outline: 2px solid #6fb6ff; outline-offset: 2px; }
+.bar { display: inline-flex; align-items: center; gap: 6px; }
+.bar i { display: inline-block; width: 80px; height: 6px; background: #26323d; border-radius: 3px; position: relative; overflow: hidden; }
+.bar i b { position: absolute; top: 0; bottom: 0; background: #6fb6ff; }
+.bar i::after { content: ""; position: absolute; left: 50%; top: 0; bottom: 0; width: 1px; background: #4a5a69; }
+/* connection status: out of the way, top left, faint */
+#src { position: fixed; left: max(12px, env(safe-area-inset-left, 0px)); top: max(10px, env(safe-area-inset-top, 0px));
+  font: 11px "IBM Plex Mono", ui-monospace, monospace; color: var(--muted); opacity: 0.55; }
+/* Portrait (the robot's phone): sound and bars centred in a column, kept
+   off the bottom corners, which the cradle hides. */
+@media (max-aspect-ratio: 10/13) {
+  .hud { left: 50%; transform: translateX(-50%); bottom: max(64px, env(safe-area-inset-bottom, 0px));
+    flex-direction: column; align-items: stretch; gap: 8px; font-size: 13px; }
+  .hud button { padding: 10px 14px; }
+  .bar { justify-content: space-between; gap: 12px; }
+  .bar i { width: 150px; height: 8px; border-radius: 4px; }
+}
+</style>
+</head>
+<body>
+<canvas id="face" aria-label="Robot face showing its current valence, arousal and dominance"></canvas>
+<div class="hud">
+  <button id="sound" type="button">Sound: tap to turn on</button>
+  <span class="bar">valence <i><b id="bv"></b></i></span>
+  <span class="bar">arousal <i><b id="ba"></b></i></span>
+  <span class="bar">dominance <i><b id="bd"></b></i></span>
+</div>
+<div id="src">connecting…</div>
+<script>
+(() => {
+  const cv = document.getElementById('face'), ctx = cv.getContext('2d');
+  const target = { valence: 0, arousal: 0.4, dominance: 0 };
+  const mid = { valence: 0, arousal: 0.4, dominance: 0 };   // the stream with its jitter filtered out
+  const now = { valence: 0, arousal: 0.4, dominance: 0 };   // what is shown
+  const src = document.getElementById('src');
+  let t0 = performance.now(), blinkAt = 0, blinkT = 1, phase = 0, lastValence = 0;
+
+  const q = new URLSearchParams(location.search);
+  function resize() {
+    // At most 1.5 canvas pixels per CSS pixel (?dpr= to change): the robot's
+    // Pixel 3a is 2.75, and drawing at full resolution took 60% of a core.
+    const r = Math.min(window.devicePixelRatio || 1, parseFloat(q.get('dpr')) || 1.5);
+    cv.width = innerWidth * r; cv.height = innerHeight * r;
+    ctx.setTransform(r, 0, 0, r, 0, 0);
+  }
+  addEventListener('resize', resize); resize();
+
+  // -- data: live from the phone, a trace, or idle --------------------------
+  function setState(e) {
+    if (!e) return;
+    for (const k of ['valence', 'arousal', 'dominance'])
+      if (typeof e[k] === 'number' && isFinite(e[k])) target[k] = e[k];
+  }
+  function playTrace(tr) {
+    src.textContent = 'recording';
+    const start = performance.now();
+    (function tick() {
+      const s = ((performance.now() - start) / 1000) % (tr.t[tr.t.length - 1] || 1);
+      let i = Math.min(tr.t.length - 1, Math.floor(s * (tr.hz || 10)));
+      setState({ valence: tr.valence[i], arousal: tr.arousal[i], dominance: (tr.dominance || [])[i] });
+      setTimeout(tick, 100);
+    })();
+  }
+  if (window.FACE_TRACE) playTrace(window.FACE_TRACE);
+  else if (q.get('trace')) fetch(q.get('trace')).then(r => r.json()).then(playTrace)
+    .catch(() => { src.textContent = 'trace not found'; });
+  else {
+    try {
+      // ?robot=host:port reads a phone from a page served elsewhere (e.g. this file opened on a laptop).
+      const host = q.get('robot') || location.host;
+      const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + host + '/ws');
+      ws.onopen = () => { src.textContent = '● connected'; };
+      ws.onmessage = m => { try { setState(JSON.parse(m.data).emotion); } catch (e) {} };
+      ws.onclose = () => { src.textContent = 'no robot (idle)'; };
+    } catch (e) { src.textContent = 'no robot (idle)'; }
+  }
+
+  // -- sound: a soft voice, pitch with arousal, interval with valence --------
+  // Browsers only allow audio after a tap, so it starts off.
+  let audio = null, soundOn = false;
+  const btn = document.getElementById('sound');
+  btn.onclick = () => {
+    if (!audio) { try { audio = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { btn.textContent = 'Sound: not available'; return; } }
+    soundOn = !soundOn; if (audio.state === 'suspended') audio.resume();
+    btn.textContent = soundOn ? 'Sound: on' : 'Sound: off';
+    if (soundOn) chirp(now.valence, now.arousal);
+  };
+  function chirp(v, a) {
+    if (!audio || !soundOn) return;
+    const base = 220 + 440 * a;                      // higher when aroused
+    const step = v >= 0 ? 1.26 : 0.84;               // major third up, or a fall
+    const o = audio.createOscillator(), g = audio.createGain(), t = audio.currentTime;
+    o.type = v >= 0 ? 'sine' : 'triangle';
+    o.frequency.setValueAtTime(base, t);
+    o.frequency.exponentialRampToValueAtTime(base * step, t + 0.12 + 0.2 * (1 - a));
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(0.12, t + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.35);
+    o.connect(g).connect(audio.destination); o.start(t); o.stop(t + 0.4);
+  }
+
+  // -- drawing ---------------------------------------------------------------
+  const lerp = (a, b, k) => a + (b - a) * k;
+  // Critically damped springs, one per face feature: position and velocity
+  // both stay continuous, so a feature starts and stops moving gently.
+  // ?spring= sets the stiffness (rad/s; 14 settles in ~0.3 s).
+  const OMEGA = Math.max(1, parseFloat(new URLSearchParams(location.search).get('spring')) || 14);
+  const springs = {};
+  function spring(name, goal, dt) {
+    const s = springs[name] || (springs[name] = { x: goal, v: 0 });
+    for (let n = Math.ceil(dt / 0.008), h = dt / n; n > 0; n--) {
+      s.v += (OMEGA * OMEGA * (goal - s.x) - 2 * OMEGA * s.v) * h;
+      s.x += s.v * h;
+    }
+    return s.x;
+  }
+  const NEG = '#ff6b6b', POS = '#5fd38d';   // below / above the middle of an axis
+  function hueFor(v) { return lerp(215, 40, (v + 1) / 2); }   // blue (sad) .. amber (glad)
+
+  // The phone sends a new value every ~60 ms; the face follows a moving average
+  // with this time constant (s), ?tau=0.5 to change it.
+  const TAU = Math.max(0.05, parseFloat(q.get('tau')) || 0.5);
+  const FAST = Math.min(TAU, Math.max(0.03, parseFloat(q.get('fast')) || 0.05));   // ?fast= for big changes
+
+  // Valence, arousal and dominance as a 3D box, top right: valence left to
+  // right, arousal up, dominance front (in control) to back (helpless). The
+  // state is a dot with its shadows on the floor and the two back walls and
+  // the last 10 s as a trail. Drag the box to turn it.
+  const trail = []; let trailT = 0;
+  let az = -0.6, el = 0.38, box = null, drag = null;
+  cv.addEventListener('pointerdown', e => {
+    if (box && Math.abs(e.clientX - box.cx) < box.r && Math.abs(e.clientY - box.cy) < box.r) {
+      drag = { x: e.clientX, y: e.clientY, az, el }; cv.setPointerCapture(e.pointerId);
+    }
+  });
+  cv.addEventListener('pointermove', e => {
+    if (!drag) return;
+    az = drag.az + (e.clientX - drag.x) * 0.01;
+    el = Math.max(0.05, Math.min(1.3, drag.el + (e.clientY - drag.y) * 0.01));
+  });
+  cv.addEventListener('pointerup', () => { drag = null; });
+  function drawAxes(v, a, d, dt) {
+    const y = 2 * a - 1;
+    trailT += dt;
+    if (trailT >= 0.2) { trailT = 0; trail.push([v, y, d]); if (trail.length > 50) trail.shift(); }
+    const W = innerWidth, H = innerHeight;
+    // Portrait (the robot's phone): centred below the face; else top right.
+    const tall = H > 1.3 * W;
+    const L = tall ? Math.min(W * 0.17, H * 0.083) : Math.max(55, Math.min(95, Math.min(W, H) * 0.1));   // half a box edge, px
+    const r = L * 1.95, cx = tall ? W / 2 : W - 14 - r, cy = tall ? H * 0.58 : 14 + r;
+    box = { cx, cy, r };
+    const ca = Math.cos(az), sa = Math.sin(az), ce = Math.cos(el), se = Math.sin(el);
+    // world (x valence, y arousal, z dominance; +z toward the viewer) -> screen
+    const depth = (x, z) => -x * sa + z * ca;
+    const P = (x, yy, z) => [cx + (x * ca + z * sa) * L, cy - (yy * ce - depth(x, z) * se) * L];
+    const line = (p, q) => { ctx.beginPath(); ctx.moveTo(p[0], p[1]); ctx.lineTo(q[0], q[1]); ctx.stroke(); };
+    const poly = pts => { ctx.beginPath(); pts.forEach((p, i) => i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1])); ctx.closePath(); };
+    const muted = getComputedStyle(document.documentElement).getPropertyValue('--muted');
+    // the far walls: the x side and the z side that face away from the viewer
+    const xw = depth(1, 0) < 0 ? 1 : -1, zw = depth(0, 1) < 0 ? 1 : -1;
+    ctx.save();
+    ctx.fillStyle = 'rgba(24,33,42,0.88)'; ctx.strokeStyle = '#2c3a47'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.roundRect ? ctx.roundRect(cx - r, cy - r, 2 * r, 2 * r, 10) : ctx.rect(cx - r, cy - r, 2 * r, 2 * r);
+    ctx.fill(); ctx.stroke();
+    // walls with a grid
+    const walls = [
+      [(u, w) => P(u, -1, w), 'rgba(111,182,255,0.06)'],    // floor: valence x dominance
+      [(u, w) => P(u, w, zw), 'rgba(111,182,255,0.04)'],    // back: valence x arousal
+      [(u, w) => P(xw, w, u), 'rgba(111,182,255,0.04)'],    // side: dominance x arousal
+    ];
+    for (const [f, fill] of walls) {
+      poly([f(-1, -1), f(1, -1), f(1, 1), f(-1, 1)]); ctx.fillStyle = fill; ctx.fill();
+      ctx.strokeStyle = '#2a3743'; ctx.lineWidth = 1;
+      for (const g of [-1, -0.5, 0, 0.5, 1]) { line(f(g, -1), f(g, 1)); line(f(-1, g), f(1, g)); }
+    }
+    // the middle of arousal, around both back walls
+    ctx.strokeStyle = '#5b6b7a'; ctx.lineWidth = 1.2; ctx.setLineDash([5, 4]);
+    line(P(-1, 0, zw), P(1, 0, zw)); line(P(xw, 0, -1), P(xw, 0, 1)); ctx.setLineDash([]);
+    // axes through the middle of the floor and up the far corner
+    ctx.strokeStyle = muted; ctx.lineWidth = 1.3;
+    line(P(-1, -1, 0), P(1, -1, 0)); line(P(0, -1, -1), P(0, -1, 1)); line(P(xw, -1, zw), P(xw, 1, zw));
+    ctx.fillStyle = muted; ctx.font = '10px "IBM Plex Mono", ui-monospace, monospace';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    const label = (t, p, dx, dy) => ctx.fillText(t, p[0] + dx, p[1] + dy);
+    label('glad', P(1.22, -1, 0), 0, 0); label('sad', P(-1.22, -1, 0), 0, 0);
+    label('in control', P(0, -1, 1.28), 0, 4); label('helpless', P(0, -1, -1.28), 0, -2);
+    label('aroused', P(xw, 1, zw), 0, -9); label('calm', P(xw, -0.88, zw), -18, 0);
+    // trail
+    trail.forEach((t, i) => {
+      const q = P(t[0], t[1], t[2]);
+      ctx.fillStyle = `hsla(${hueFor(t[0])},70%,60%,${0.06 + 0.4 * i / trail.length})`;
+      ctx.beginPath(); ctx.arc(q[0], q[1], 2, 0, Math.PI * 2); ctx.fill();
+    });
+    // shadows and the dot
+    const hue = hueFor(v), dot = P(v, y, d);
+    const shadows = [P(v, -1, d), P(v, y, zw), P(xw, y, d)];
+    // each line's length is one coordinate: to the floor arousal, to the back
+    // wall dominance, to the side wall valence; red below the middle, green above
+    ctx.setLineDash([4, 3]); ctx.lineWidth = 1.6;
+    [y, d, v].forEach((c, i) => { ctx.strokeStyle = c < 0 ? NEG : POS; line(dot, shadows[i]); });
+    ctx.setLineDash([]);
+    ctx.fillStyle = `hsla(${hue},50%,60%,0.55)`;
+    for (const q of shadows) { ctx.beginPath(); ctx.arc(q[0], q[1], 3, 0, Math.PI * 2); ctx.fill(); }
+    ctx.fillStyle = `hsl(${hue},75%,62%)`; ctx.strokeStyle = '#10161c'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(dot[0], dot[1], 6.5, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+    ctx.restore();
+  }
+
+  // Drawn at most FPS times a second (?fps= to change), for the phone's sake.
+  const FPS = Math.max(5, parseFloat(q.get('fps')) || 30);
+  function frame(ms) {
+    if (ms - t0 < 1000 / FPS - 2) { requestAnimationFrame(frame); return; }
+    const dt = Math.min(0.1, (ms - t0) / 1000); t0 = ms;
+    // The phone's values jitter sample to sample (valence by up to ~0.5 at
+    // ~40 Hz), so they are first averaged over 0.05 s. The face then follows
+    // that slowly (TAU) through small changes and fast (FAST) through big
+    // ones: a bump shows within ~0.2 s, and the face does not twitch.
+    const kj = 1 - Math.exp(-dt / 0.05);
+    for (const key in now) {
+      mid[key] = lerp(mid[key], target[key], kj);
+      const gap = Math.abs(mid[key] - now[key]) * (key === 'arousal' ? 2 : 1);   // arousal spans 0..1
+      const tau = lerp(TAU, FAST, Math.min(1, Math.max(0, (gap - 0.06) / 0.14)));
+      now[key] = lerp(now[key], mid[key], 1 - Math.exp(-dt / tau));
+    }
+    const v = Math.max(-1, Math.min(1, now.valence)), a = Math.max(0, Math.min(1, now.arousal));
+    window.__face = { now, target, dt, blinkT, springs };   // for checking from devtools
+    const d = Math.max(-1, Math.min(1, now.dominance));
+    const bar = (id, x) => { document.getElementById(id).style.cssText =
+      (x >= 0 ? `left:50%;width:${x * 50}%` : `left:${50 + x * 50}%;width:${-x * 50}%`) + `;background:${x < 0 ? NEG : POS}`; };
+    bar('bv', v);
+    const ac = 2 * a - 1;   // arousal 0..1, shown about its middle like the others
+    bar('ba', ac); bar('bd', d);
+
+    // A chirp when valence turns, or every few seconds when aroused.
+    phase += dt * (0.5 + 2.5 * a);
+    if (Math.abs(v - lastValence) > 0.25 || (Math.random() < dt * a * a * 0.6)) { chirp(v, a); lastValence = v; }
+
+    // Blinks: rarer when aroused; each a smooth close and open over 0.22 s.
+    if (ms > blinkAt) { blinkT = 0; blinkAt = ms + 1500 + Math.random() * (2000 + 5000 * (1 - a)) * (0.4 + a); }
+    blinkT = Math.min(1, blinkT + dt / 0.22);
+    const blink = Math.sin(Math.PI * blinkT) ** 2;
+
+    const W = innerWidth, H = innerHeight;
+    // Portrait (the robot's phone): a bigger face in the upper half, the 3D
+    // box below it; otherwise the face fills the middle.
+    const tall = H > 1.3 * W, S = tall ? Math.min(W * 1.15, H * 0.5) : Math.min(W, H);
+    ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue('--bg'); ctx.fillRect(0, 0, W, H);
+    // Every feature eases to its new shape through a critically damped spring
+    // (OMEGA), so a sudden change in the signals still moves the face smoothly.
+    const sp = (name, goal) => spring(name, goal, dt);
+    const hue = sp('hue', hueFor(v)), sat = sp('sat', 45 + 35 * a), light = sp('light', 55 + 8 * v);
+    const tremble = sp('tremble', a > 0.7 ? (a - 0.7) * 6 : 0);   // a tremble when highly aroused
+    const cx = W / 2 + Math.sin(phase * 7) * tremble;
+    // Dominance is posture: in control the face is bigger, higher and steady
+    // with a bright glow; helpless it shrinks, sinks, dims, its lids droop and
+    // its gaze wanders down and away.
+    const control = sp('control', Math.max(0, d)), helpless = sp('helpless', Math.max(0, -d));
+    const cy = (tall ? H * 0.27 : H / 2) + Math.sin(phase) * S * 0.01 * (0.3 + a) + sp('rise', -d * S * 0.05);
+    ctx.save(); ctx.translate(cx, cy); ctx.rotate(sp('tilt', -d * 0.06));
+    const grow = sp('grow', 1 + 0.08 * d); ctx.scale(grow, grow);
+
+    // Head glow
+    const R = S * 0.42;
+    const glow = ctx.createRadialGradient(0, 0, R * 0.2, 0, 0, R * 1.1);
+    glow.addColorStop(0, `hsla(${hue},${sat}%,${light}%,${sp('glow', 0.2 + 0.12 * d)})`); glow.addColorStop(1, 'hsla(0,0%,0%,0)');
+    ctx.fillStyle = glow; ctx.beginPath(); ctx.arc(0, 0, R * 1.1, 0, Math.PI * 2); ctx.fill();
+
+    // Eyes: wider and bigger-pupilled when aroused
+    const ex = S * 0.16, ey = -S * 0.06, ew = S * 0.085;
+    const open = Math.max(0.05, sp('open', 0.45 + 0.75 * a) * (1 - 0.95 * blink));
+    const pupil = ew * sp('pupil', 0.35 + 0.35 * a);
+    const lift = ew * sp('lift', 1.25 + 0.35 * a);
+    const slant = sp('slant', -v * 0.25 * (1 - a) + a * 0.35 * Math.min(1, Math.max(0, -v) * 3));
+    const wander = ew * 0.25 * (0.3 + a) * (1 - 0.6 * control) * (1 + helpless);
+    const look = Math.sin(phase * 0.7) * wander + helpless * ew * 0.3 * Math.sin(phase * 0.13);
+    const lookY = helpless * ew * 0.3;   // eyes down when helpless
+    const droop = helpless * 0.45;       // upper lids lowered
+    for (const s of [-1, 1]) {
+      ctx.save(); ctx.translate(s * ex, ey);
+      ctx.fillStyle = `hsl(${hue},${sat * 0.4}%,92%)`;
+      ctx.beginPath(); ctx.ellipse(0, 0, ew, ew * open, 0, 0, Math.PI * 2); ctx.fill();
+      ctx.save(); ctx.beginPath(); ctx.ellipse(0, 0, ew, ew * open, 0, 0, Math.PI * 2); ctx.clip();
+      ctx.fillStyle = `hsl(${hue},${sat}%,${light - 25}%)`;
+      ctx.beginPath(); ctx.arc(look, lookY, pupil, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = 'rgba(255,255,255,0.8)';
+      ctx.beginPath(); ctx.arc(look + pupil * 0.35, lookY - pupil * 0.35, pupil * 0.22, 0, Math.PI * 2); ctx.fill();
+      if (droop > 0.01) {   // the upper lid, in the face's dark tone
+        ctx.fillStyle = `hsl(${hue},25%,13%)`;
+        ctx.fillRect(-ew, -ew * open, 2 * ew, 2 * ew * open * droop);
+      }
+      ctx.restore();
+      // Brows: inner ends up when sad and calm, down when sad and aroused
+      ctx.strokeStyle = `hsl(${hue},${sat}%,${light}%)`; ctx.lineWidth = S * 0.018; ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.moveTo(-ew * 0.9, -lift - s * slant * ew * 0.9); ctx.lineTo(ew * 0.9, -lift + s * slant * ew * 0.9);
+      ctx.stroke(); ctx.restore();
+    }
+
+    // Mouth: wider and curved up when glad, curved down when sad, open when aroused
+    const mw = S * sp('mw', 0.19 + 0.03 * v);
+    const my = S * 0.17, curve = S * sp('curve', v * 0.07);
+    const gap = S * sp('gap', 0.004 + 0.05 * Math.max(0, a - 0.35));
+    ctx.strokeStyle = `hsl(${hue},${sat}%,${light}%)`; ctx.lineWidth = S * 0.02; ctx.lineCap = 'round';
+    // Round joins: with the default miter the mouth's two sharp corners grew
+    // spikes past the ends that switched on and off with the opening.
+    ctx.lineJoin = 'round';
+    ctx.fillStyle = `hsla(${hue},${sat}%,${light - 30}%,0.9)`;
+    ctx.beginPath(); ctx.moveTo(-mw / 2, my);
+    ctx.quadraticCurveTo(0, my + curve + gap, mw / 2, my);
+    ctx.quadraticCurveTo(0, my + curve - gap, -mw / 2, my);
+    ctx.closePath(); ctx.globalAlpha = Math.min(1, Math.max(0, (gap / S - 0.004) / 0.012)); ctx.fill(); ctx.globalAlpha = 1; ctx.stroke();
+    ctx.restore();
+    drawAxes(v, a, d, dt);
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

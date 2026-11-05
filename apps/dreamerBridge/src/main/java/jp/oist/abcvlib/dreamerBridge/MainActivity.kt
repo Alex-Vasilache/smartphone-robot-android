@@ -8,8 +8,12 @@ import android.os.Process
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.view.GestureDetector
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
+import android.webkit.WebView
+import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.activity.addCallback
@@ -51,13 +55,40 @@ open class MainActivity : AbcvlibActivity(), SerialReadyListener {
     private lateinit var stopButton: TextView
     private var statusMargin = -1   // the layout's own, restored on hiding
 
+    /**
+     * The robot's face (the /face page main.py serves, valence, arousal and
+     * dominance from the world model) over the gauges: swipe left to show it,
+     * right (or back) to return. Loaded only while shown, and blanked when
+     * hidden, so its drawing costs the control loop nothing otherwise.
+     */
+    private lateinit var faceView: WebView
+    private lateinit var swipe: GestureDetector
+    private val faceShown get() = faceView.visibility == View.VISIBLE
+
     override fun onCreate(savedInstanceState: Bundle?) {
         enableMainLoop(false)
         // The serial reader hex-dumps every chunk at debug level; that runs
         // between the RP2040's reply and the control loop seeing it.
         Logger.setQuiet(true)
         binding = ActivityMainBinding.inflate(layoutInflater)
-        setContentView(binding.root)
+        setContentView(FrameLayout(this).apply {
+            addView(binding.root)
+            faceView = WebView(this@MainActivity).apply {
+                setBackgroundColor(Color.parseColor("#FF10161C"))
+                settings.javaScriptEnabled = true
+                settings.mediaPlaybackRequiresUserGesture = false
+                visibility = View.GONE
+            }
+            addView(faceView, FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+        })
+        swipe = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
+            override fun onFling(e1: MotionEvent?, e2: MotionEvent, vx: Float, vy: Float): Boolean {
+                if (Math.abs(vx) < 800 || Math.abs(vx) < 1.5f * Math.abs(vy)) return false
+                showFace(vx < 0)
+                return true
+            }
+        })
         // Full screen: the display is read from a distance on a moving robot,
         // so every pixel goes to the gauges. Swipe from an edge to see the bars.
         supportActionBar?.hide()
@@ -86,6 +117,7 @@ open class MainActivity : AbcvlibActivity(), SerialReadyListener {
         // wheels by itself 250 ms after the commands stop.
         if (this !is PlayerActivity) {
             onBackPressedDispatcher.addCallback(this) {
+                if (faceShown) { showFace(false); return@addCallback }
                 startActivity(Intent(this@MainActivity, PickerActivity::class.java))
                 finish()
                 Process.killProcess(Process.myPid())
@@ -96,6 +128,24 @@ open class MainActivity : AbcvlibActivity(), SerialReadyListener {
         if (noBase()) {
             Logger.i("MainActivity", "no_base set in trainer.json; starting without the robot")
             initPython()
+        }
+    }
+
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        if (::swipe.isInitialized && swipe.onTouchEvent(ev)) return true
+        return super.dispatchTouchEvent(ev)
+    }
+
+    private fun showFace(show: Boolean) {
+        if (show == faceShown) return
+        if (show) {
+            faceView.loadUrl("http://127.0.0.1:8080/face")
+            faceView.onResume()
+            faceView.visibility = View.VISIBLE
+        } else {
+            faceView.visibility = View.GONE
+            faceView.loadUrl("about:blank")
+            faceView.onPause()
         }
     }
 
@@ -190,6 +240,15 @@ open class MainActivity : AbcvlibActivity(), SerialReadyListener {
         }
 
         val py = Python.getInstance()
+        // Python modules pushed to files/python (tools/robot/dev/push_python.sh)
+        // shadow the app's own, so a Python change needs an adb push and an
+        // app restart, not a reinstall. Listed in the log so a stale one shows.
+        val overrides = File(getExternalFilesDir(null), "python")
+        if (overrides.isDirectory) {
+            py.getModule("sys")["path"]?.callAttr("insert", 0, overrides.path)
+            Logger.i("MainActivity", "python overrides: " +
+                    (overrides.list()?.sorted()?.joinToString() ?: "none"))
+        }
         val setupModule = py.getModule("abcvlib")
         // inject variables to python
         // main.loop() is one full control step and paces itself against

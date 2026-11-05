@@ -37,6 +37,7 @@ and a client too slow to take a frame within SEND_TIMEOUT is dropped.
 import base64
 import hashlib
 import json
+import os
 import pkgutil
 import socket
 import struct
@@ -110,8 +111,12 @@ class _Client:
 class WebUI:
 
     def __init__(self, commands, port=PORT, history=None, on_restart=None,
-                 on_pause=None, on_play=None):
+                 on_pause=None, on_play=None, face_path=None):
         self.commands = commands
+        # A face.html pushed to the app's files folder (adb push) is served
+        # instead of the built-in one, read on every request, so the face can
+        # be changed without reinstalling the app or restarting a run.
+        self.face_path = face_path
         self.port = port
         self.history = history or dict  # () -> the run's history as a dict
         self.on_restart = on_restart    # () -> None; raises if not offered
@@ -120,10 +125,20 @@ class WebUI:
         self.state = {}   # the latest published, never mutated
         self.page = pkgutil.get_data('webpages', 'index.html')
         self.dash = pkgutil.get_data('webpages', 'dashboard.html')
+        self.face = pkgutil.get_data('webpages', 'face.html')
         self._server = None
         self._clients = set()
         self._cond = threading.Condition()
         self._version = 0
+
+    def face_page(self):
+        try:
+            if self.face_path and os.path.exists(self.face_path):
+                with open(self.face_path, 'rb') as f:
+                    return f.read()
+        except OSError:
+            pass
+        return self.face
 
     def publish(self, state):
         """Hand the page a new state. Cheap: the broadcaster does the sending."""
@@ -207,6 +222,8 @@ class WebUI:
                     self._send(200, ui.page, 'text/html; charset=utf-8')
                 elif path == '/dash':
                     self._send(200, ui.dash, 'text/html; charset=utf-8')
+                elif path == '/face':
+                    self._send(200, ui.face_page(), 'text/html; charset=utf-8')
                 elif path == '/history':
                     self._json(ui.history())
                 elif path == '/state':

@@ -12,10 +12,12 @@ android {
 
     defaultConfig {
         ndk {
-            // 64-bit only: Chaquopy offers Python 3.13 for arm64-v8a and
-            // x86_64 alone, and the robot phone (Pixel 3a) is arm64. Dropping
-            // the 32-bit ABIs also roughly halves the APK.
-            abiFilters += listOf("arm64-v8a", "x86_64")
+            // arm64 only: Chaquopy offers Python 3.13 for arm64-v8a and
+            // x86_64 alone, the robot phone (Pixel 3a) is arm64, and the
+            // emulator's x86_64 copies of every native library added 36 MB to
+            // each install over WiFi (2026-11-05). Add "x86_64" back to run
+            // the app in the emulator.
+            abiFilters += listOf("arm64-v8a")
         }
     }
 }

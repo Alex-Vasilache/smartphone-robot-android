@@ -217,7 +217,8 @@ class NumpyPolicy:
     `deter` is what `precompute` returned for this same `carry`.
     """
     tokens = self._encode(obs)
-    stoch, _ = self._obs_stoch(deter, tokens)
+    stoch, logit = self._obs_stoch(deter, tokens)
+    self.last_post = (deter, stoch, logit)   # for deploy/emotion.py
     act = self._actor(deter, stoch, mode)
     carry = dict(deter=deter, stoch=stoch, prevact=act)
     return act, carry

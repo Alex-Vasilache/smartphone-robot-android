@@ -16,6 +16,7 @@ import beyond the standard library.
 
 import os
 import tempfile
+import threading
 import time
 
 import numpy as np
@@ -23,6 +24,71 @@ import numpy as np
 from numpy_policy import NumpyPolicy, expand_delta, is_delta  # noqa: E402  (flat layout on the phone)
 
 __all__ = ['PolicyRunner']
+
+
+def travel_limit(act, pos, lo, hi, state=None):
+  """Scale wheel commands that push the robot further the way it has already
+  travelled: none below `lo` of leaky travel (`pos`, the mean of the two
+  wheels' leaky distances, phone mm over ~pos_tau s), linearly to 0 at `hi`.
+  Reaching `hi` latches: pushing on that way stays blocked until the travel
+  is back under `lo` (state, a 1-list holding the blocked direction, keeps
+  the latch between calls); a proportional fade alone let a policy that kept
+  pushing settle into a steady crawl at hi (e30111, 0.08 m/s). Commands that
+  brake or reverse pass whole, so short full-speed catches stay full while
+  sustained driving stops. hi <= 0: off. A wheel command a turns its wheel
+  backwards (travel -a), so it pushes on when -a has the sign of pos. The
+  trainer (embodied/envs/robot.py) and the phone (deploy/policy_runner.py)
+  each keep a copy, so change both."""
+  if hi <= 0:
+    return [float(a) for a in act]
+  state = state if state is not None else [0.0]
+  side = float(np.sign(pos))
+  if state[0] and (abs(pos) < lo or side != state[0]):
+    state[0] = 0.0
+  if abs(pos) >= hi:
+    state[0] = side
+  if state[0]:
+    k = 0.0
+  elif abs(pos) <= lo:
+    return [float(a) for a in act]
+  else:
+    k = min(1.0, max(0.0, (hi - abs(pos)) / max(hi - lo, 1e-6)))
+  return [float(a) * k if -float(a) * pos > 0 else float(a) for a in act]
+
+
+class Fatigue:
+  """Fades a wheel command the policy holds: each wheel's output is scaled by
+  1 - held/steps, so a command kept within `tol` of where it started, in the
+  same direction and beyond `dead`, reaches 0 after `steps` control steps.
+  Any larger change (or a reversal) restarts that wheel at full strength.
+  Short bursts to catch a fall pass nearly whole; steady driving cannot last.
+  steps 0: off. The trainer (embodied/envs/robot.py) and the phone
+  (deploy/policy_runner.py) each keep a copy, so change both."""
+
+  def __init__(self, steps=0, tol=0.15, dead=0.05):
+    self.set(steps, tol, dead)
+
+  def set(self, steps, tol=0.15, dead=0.05):
+    self.steps, self.tol, self.dead = int(steps), float(tol), float(dead)
+    self.reset()
+
+  def reset(self):
+    self.ref = [None, None]
+    self.held = [0, 0]
+
+  def __call__(self, act):
+    if self.steps <= 0:
+      return [float(a) for a in act]
+    out = []
+    for i, a in enumerate(act[:2]):
+      a, ref = float(a), self.ref[i]
+      if (ref is not None and abs(a) > self.dead and a * ref > 0
+          and abs(a - ref) <= self.tol):
+        self.held[i] += 1
+      else:
+        self.ref[i], self.held[i] = a, 0
+      out.append(a * max(0.0, 1.0 - self.held[i] / self.steps))
+    return out
 
 
 class PolicyRunner:
@@ -46,10 +112,22 @@ class PolicyRunner:
     # distribution's mode, for running a finished policy (the player).
     self.mode = 'train'
     self.prepared = 0     # steps that used a prepared half
+    # Emotion (deploy/emotion.py), for weights exported with emotion=True:
+    # every FEEL_EVERY steps from the rewards since, empowerment on a thread
+    # of its own every EMPOWER_S so the control tick never waits for it.
+    self.emotion = None
+    self.emotion_state = None
+    self._feel = [0.0, 0, False]     # discounted reward sum, steps, a reset
+    self._emo_lock = threading.Lock()
+    self._emo_thread = None
     # The leaky wheel distance of a policy that observes 'position'; kept
     # across episodes and weight swaps, as the trainer keeps its own.
     self.pos = np.zeros(2, np.float64)
     self.prev_dist = None
+    # Set from the trainer's pause frames; the app applies it to each action.
+    self.fatigue = Fatigue()
+    self.travel = (0.0, 0.0)   # (lo, hi) from the trainer; see limit()
+    self._travel_latch = [0.0]
     if path and os.path.exists(path):
       self.load_path(path, stamp='initial')
 
@@ -75,7 +153,68 @@ class PolicyRunner:
     self._pre = None
     if self.carry is None:
       self.carry = policy.initial()
+    self._install_emotion(policy)
     return policy.meta
+
+  FEEL_EVERY = 4
+  EMPOWER_S = 0.5
+
+  def _install_emotion(self, policy):
+    if 'emotion' not in policy.meta:
+      self.emotion = None
+      return
+    try:
+      from emotion import Emotion  # noqa: E402  (flat layout on the phone)
+    except ImportError:
+      return
+    with self._emo_lock:
+      if self.emotion is None:
+        self.emotion = Emotion(policy, gamma=policy.meta['emotion']['gamma'],
+                               every=0, tau=650 // self.FEEL_EVERY)
+      else:
+        self.emotion.p = policy   # keep the running normalisation
+    if self._emo_thread is None:
+      self._emo_thread = threading.Thread(target=self._empower_loop, daemon=True)
+      self._emo_thread.start()
+
+  def _empower_loop(self):
+    while True:
+      time.sleep(self.EMPOWER_S)
+      emo, last = self.emotion, getattr(self.policy, 'last_post', None)
+      if emo is None or last is None:
+        continue
+      try:
+        value = emo._empowerment(last[0], last[1])
+        with self._emo_lock:
+          emo.empowerment = value
+      except Exception as e:  # noqa: BLE001 -- the face is never worth a crash
+        print('dreamerBridge: empowerment failed: %s' % e)
+
+  def feel(self, reward):
+    """After each step, with the reward it scored: updates emotion_state."""
+    emo = self.emotion
+    if emo is None or getattr(self.policy, 'last_post', None) is None:
+      return
+    acc = self._feel
+    acc[0] += (emo.gamma ** acc[1]) * float(reward)
+    acc[1] += 1
+    acc[2] = acc[2] or self.was_first
+    if acc[1] < self.FEEL_EVERY:
+      return
+    deter, stoch, logit = self.policy.last_post
+    try:
+      with self._emo_lock:
+        sig = emo.step(deter, logit, stoch, acc[0], is_first=acc[2],
+                       steps=acc[1])
+      self.emotion_state = dict(
+          valence=sig['face_valence'], arousal=sig['arousal'],
+          dominance=sig['dominance'], td=sig['td'], value=sig['value'],
+          surprise=sig['surprise'], unexpected=sig['unexpected'],
+          novelty=sig['novelty'], empowerment=sig['empowerment'])
+    except Exception as e:  # noqa: BLE001
+      print('dreamerBridge: emotion failed: %s' % e)
+      self.emotion = None
+    self._feel = [0.0, 0, False]
 
   @staticmethod
   def build_blob(blob, path):
@@ -118,8 +257,9 @@ class PolicyRunner:
       self.carry = self.policy.initial()
     self.is_first = True
     self._pre = None
+    self.fatigue.reset()
 
-  def observe(self, sensors, command=None):
+  def observe(self, sensors, command=None, track=True):
     """Sensor dict -> the observation the network expects.
 
     Mirrors `robot.py:_obs`. Kept as its own method so the same scaling can be
@@ -141,7 +281,14 @@ class PolicyRunner:
     if 'command' in self.policy.meta['obs_keys']:
       obs['command'] = np.clip(np.asarray(
           command if command is not None else (0.0, 0.0), np.float32), -1, 1)
-    if 'position' in self.policy.meta['obs_keys']:
+    if 'position' in self.policy.meta['obs_keys'] and not track:
+      # warm() and benchmark() pass made-up sensors with no wheel distances:
+      # tracking those threw away the next real step's travel as a counter
+      # jump and leaked an extra step, so the phone's position (its policy's
+      # input and the travel limiter's) read ~1/3 of the trainer's (e30112).
+      obs['position'] = np.clip(
+          self.pos * s['obs_pos_scale'], -clip, clip).astype(np.float32)
+    elif 'position' in self.policy.meta['obs_keys']:
       # Mirrors robot.py:track_position, one step per observation.
       dist = np.array([float(sensors.get('wheel_distance_l', 0.0)),
                        float(sensors.get('wheel_distance_r', 0.0))])
@@ -153,6 +300,22 @@ class PolicyRunner:
       obs['position'] = np.clip(
           self.pos * s['obs_pos_scale'], -clip, clip).astype(np.float32)
     return obs
+
+  def limit(self, act):
+    """The trainer's limits on the action act() chose: fatigue, then travel."""
+    act = self.fatigue(act)
+    lo, hi = self.travel
+    if hi > 0:
+      act = travel_limit(act, float(self.pos.mean()), lo, hi, self._travel_latch)
+    return act
+
+  def applied(self, act):
+    """The wheels got `act`, not the action act() chose (clipped by the
+    trainer's cap, held by a pause or a brake, or the trainer's own drive).
+    The next step's RSSM input is what really happened, as in replay."""
+    if self.carry is not None:
+      self.carry = dict(self.carry, prevact=np.asarray(act, np.float32))
+      self._pre = None
 
   def prepare(self):
     """Run the observation-independent half of the next step now.
@@ -202,7 +365,7 @@ class PolicyRunner:
                    wheel_speed_l=0.0, wheel_speed_r=0.0)
     pre = self._pre
     deter = pre[2] if pre is not None else self.policy.precompute(self.carry)
-    self.policy.finish(self.observe(sensors), self.carry, deter)
+    self.policy.finish(self.observe(sensors, track=False), self.carry, deter)
     self.last_warm_ms = (time.monotonic() - t0) * 1e3
 
   # -- diagnostics --------------------------------------------------------
@@ -219,7 +382,7 @@ class PolicyRunner:
     import numpy as _np
     sensors = dict(theta=0.02, angular_velocity=0.1,
                    wheel_speed_l=10.0, wheel_speed_r=-10.0)
-    obs = self.observe(sensors)
+    obs = self.observe(sensors, track=False)
     carry = self.policy.initial()
     p = self.policy
     # Warm up: first touch of each array pays page-in and any lazy dispatch.
