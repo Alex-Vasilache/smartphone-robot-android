@@ -1534,6 +1534,14 @@ def apply_pause(state):
         if t != r.travel:
             r.travel = t
             print('dreamerBridge: travel limit %.0f..%.0f' % t)
+    # Emotion settings (affect gains, the body's bumpers for pain, the event
+    # threshold): without them PolicyRunner.body stays None and pain is 0.
+    emo = state.get('emotion')
+    if emo and r is not None and hasattr(r, 'configure') and \
+            emo != getattr(r, '_configured', None):
+        r.configure(emo)
+        r._configured = emo
+        print('dreamerBridge: emotion settings %s' % sorted(emo))
     was = (robot_paused, train_paused)
     robot_paused = bool(state.get('robot', False))
     train_paused = bool(state.get('training', False))
