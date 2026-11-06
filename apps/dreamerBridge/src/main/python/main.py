@@ -76,7 +76,7 @@ GUI_PERIOD = 0.1
 # socket on another thread, so it costs the loop only building a small dict.
 # Every control step at 65 Hz: at 25 Hz the dashboard's robot drawing was a
 # visible beat behind the robot, ~20 ms of it waiting for the next frame.
-WEB_PERIOD = 0.015
+WEB_PERIOD = 1 / 30   # the face draws at 30 fps; at 65 Hz the JSON for it cost the control loop time
 RECV_TIMEOUT = 30.0
 # Connecting must fail fast. The control loop is single threaded, so a blocking
 # connect freezes sensing and the display with it -- which looks exactly like a
