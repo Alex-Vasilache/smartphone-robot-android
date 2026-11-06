@@ -510,6 +510,13 @@ def setup_player(PolicyRunner, path):
         print('dreamerBridge: no settings for %s (%s); using defaults' % (path, e))
     loaded = PolicyRunner()
     loaded.load_path(path, stamp=chosen['name'])
+    # No trainer sends the body here: take the bumpers (pain on the face)
+    # from the policy's own settings, as the trainer would.
+    if hasattr(loaded, 'configure') and 'bumper_lo' in chosen and 'bumper_hi' in chosen:
+        loaded.configure(dict(body=dict(
+            theta_zero=float(chosen.get('theta_zero', 0.0)),
+            lo=float(chosen['bumper_lo']), hi=float(chosen['bumper_hi']),
+            zone=float(chosen.get('pain_zone', 0.035)))))
     player, runner = chosen, loaded
     runner.mode = 'eval' if player_eval else 'train'
     # `onboard` turns on the warm-up before each step, as when training.
